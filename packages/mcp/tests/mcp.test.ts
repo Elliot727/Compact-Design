@@ -1,0 +1,250 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { readFileSync, readdirSync, statSync } from "node:fs";
+import { join } from "node:path";
+import { FigmaBridge } from "../src/bridge";
+import { handleRpc } from "../src/protocol";
+import { encodeStdioMessage } from "../src/stdio";
+import { createToolRunner, TOOLS } from "../src/tools";
+import { LANGUAGE_GUIDE } from "../src/guide";
+
+const runTool = createToolRunner(new FigmaBridge({ connectTimeoutMs: 20, jobTimeoutMs: 50 }));
+
+function rpc(method: string, params?: unknown, id: string | number = 1) {
+  return handleRpc({ jsonrpc: "2.0", id, method, params }, { runTool });
+}
+
+test("MCP adapter consumes core and html and does not talk to the Figma plugin API", () => {
+  const files: string[] = [];
+  const walk = (directory: string): void => readdirSync(directory).forEach((name) => {
+    const path = join(directory, name);
+    statSync(path).isDirectory() ? walk(path) : path.endsWith(".ts") && files.push(path);
+  });
+  walk("src");
+  const source = files.map((path) => readFileSync(path, "utf8")).join("\n");
+  assert.match(source, /from "@compact-design\/core"/);
+  assert.match(source, /from "@compact-design\/html"/);
+  assert.doesNotMatch(source, /\bfigma\s*\./);
+  assert.doesNotMatch(source, /function (normalizeDocument|validateDocument|lintDocument)\b/);
+});
+
+test("initialize advertises tools, resources, and prompts", async () => {
+  const response = await rpc("initialize", { protocolVersion: "2025-03-26" });
+  assert.equal(response?.result && (response.result as { serverInfo: { name: string } }).serverInfo.name, "compact-design");
+  const tools = await rpc("tools/list");
+  const names = ((tools?.result as { tools: Array<{ name: string }> }).tools).map((tool) => tool.name);
+  assert.deepEqual(names, TOOLS.map((tool) => tool.name));
+  assert.ok(names.includes("figma_import"));
+});
+
+function toolText(response: { result?: unknown } | null): string {
+  return (response?.result as { content: Array<{ text: string }> }).content[0].text;
+}
+
+test("get_language covers variables, bindings, modes, and export round-trip", async () => {
+  const response = await rpc("tools/call", { name: "get_language", arguments: {} });
+  const guide = toolText(response);
+  assert.match(guide, /bindings/);
+  assert.match(guide, /variableModes/);
+  assert.match(guide, /figma_export/);
+  assert.match(guide, /SET_VARIABLE_MODE/);
+  assert.match(guide, /"values"/);
+});
+
+test("get_language covers styles, styleRefs, grids, strokes, and isMask", async () => {
+  const response = await rpc("tools/call", { name: "get_language", arguments: {} });
+  const guide = toolText(response);
+  assert.match(guide, /styleRefs/);
+  assert.match(guide, /"styles"/);
+  assert.match(guide, /"fill": "ink"/);
+  assert.match(guide, /layoutGrids/);
+  assert.match(guide, /strokeAlign/);
+  assert.match(guide, /CENTER \| INSIDE \| OUTSIDE/);
+  assert.match(guide, /strokeCap/);
+  assert.match(guide, /strokeJoin/);
+  assert.match(guide, /isMask/);
+  assert.match(guide, /styles\/styleRefs/);
+  assert.match(guide, /layout grids/);
+});
+
+test("get_language covers effect types and BOOLEAN_OPERATION operation", async () => {
+  const response = await rpc("tools/call", { name: "get_language", arguments: {} });
+  const guide = toolText(response);
+  assert.match(guide, /DROP_SHADOW/);
+  assert.match(guide, /INNER_SHADOW/);
+  assert.match(guide, /LAYER_BLUR/);
+  assert.match(guide, /BACKGROUND_BLUR/);
+  assert.match(guide, /NOISE/);
+  assert.match(guide, /TEXTURE/);
+  assert.match(guide, /GLASS/);
+  assert.match(guide, /SHADER is supported with a required Figma shader id/);
+  assert.doesNotMatch(guide, /SHADER is not yet supported/);
+  assert.match(guide, /showShadowBehindNode/);
+  assert.match(guide, /blurType/);
+  assert.match(guide, /startRadius/);
+  assert.match(guide, /BOOLEAN_OPERATION.*operation/);
+  assert.match(guide, /UNION \| SUBTRACT \| INTERSECT \| EXCLUDE/);
+});
+
+test("get_language covers text typography controls and numberOfFixedChildren", async () => {
+  const response = await rpc("tools/call", { name: "get_language", arguments: {} });
+  const guide = toolText(response);
+  assert.match(guide, /textCase/);
+  assert.match(guide, /SMALL_CAPS/);
+  assert.match(guide, /SMALL_CAPS_FORCED/);
+  assert.match(guide, /hangingPunctuation/);
+  assert.match(guide, /hangingList/);
+  assert.match(guide, /listSpacing/);
+  assert.match(guide, /paragraphSpacing/);
+  assert.match(guide, /paragraphIndent/);
+  assert.match(guide, /no list-marker DOM/);
+  assert.match(guide, /numberOfFixedChildren/);
+  assert.match(guide, /last N children stay fixed/);
+});
+
+test("validate accepts a compact document and rejects garbage", async () => {
+  const ok = await rpc("tools/call", {
+    name: "validate",
+    arguments: { document: { canvas: { width: 320, height: 240 }, nodes: [{ type: "RECTANGLE", w: 40, h: 40, fill: "#6C5CFF" }] } }
+  });
+  assert.equal(JSON.parse(toolText(ok)).valid, true);
+  const bad = await rpc("tools/call", { name: "validate", arguments: { document: { canvas: { width: "wide" }, nodes: [] } } });
+  assert.equal((bad?.result as { isError?: boolean }).isError, true);
+});
+
+test("lint and render_html run without Figma", async () => {
+  const document = { canvas: { width: 400, height: 240, fill: "#FFFFFF" }, nodes: [{ type: "TEXT", text: "Hello", font: { family: "Arial", style: "Regular", size: 20 }, fill: "#111111", w: 200, h: 32 }] };
+  const linted = await rpc("tools/call", { name: "lint", arguments: { document } });
+  assert.equal(JSON.parse(toolText(linted)).valid, true);
+  const html = await rpc("tools/call", { name: "render_html", arguments: { document, title: "Hello" } });
+  assert.match(toolText(html), /<!doctype html>/);
+});
+
+test("figma_import without a plugin reports a clear disconnect", async () => {
+  const result = await rpc("tools/call", {
+    name: "figma_import",
+    arguments: { document: { canvas: { width: 100, height: 100 }, nodes: [{ type: "RECTANGLE", w: 10, h: 10, fill: "#000000" }] } }
+  });
+  const payload = result?.result as { isError?: boolean; content: Array<{ text: string }> };
+  assert.equal(payload.isError, true);
+  assert.match(payload.content[0].text, /Figma plugin|not listening|Open the Compact Design plugin/i);
+});
+
+test("notifications do not produce JSON-RPC responses", async () => {
+  const response = await handleRpc({ jsonrpc: "2.0", method: "notifications/initialized" }, { runTool });
+  assert.equal(response, null);
+});
+
+test("unknown methods use the JSON-RPC method-not-found code", async () => {
+  const response = await rpc("does/not/exist");
+  assert.equal(response?.error?.code, -32601);
+});
+
+test("bridge completes an import through the plugin poll and result handshake", async () => {
+  const port = 19000 + Math.floor(Math.random() * 1000);
+  const bridge = new FigmaBridge({ port, connectTimeoutMs: 100, jobTimeoutMs: 500 });
+  await bridge.listen();
+  try {
+    const poll = fetch(`http://localhost:${port}/poll?wait=400`);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const document = { nodes: [], styles: [], variables: [] } as Parameters<typeof bridge.importDocument>[0];
+    const imported = bridge.importDocument(document, "CREATE");
+    const jobResponse = await poll;
+    assert.equal(jobResponse.status, 200);
+    const job = await jobResponse.json() as { id: string; type: string; mode: string };
+    assert.equal(job.type, "import");
+    assert.equal(job.mode, "CREATE");
+    const resultResponse = await fetch(`http://localhost:${port}/result`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: job.id, message: { type: "import-complete", count: 1, created: 1, warnings: [] } })
+    });
+    assert.equal(resultResponse.status, 200);
+    assert.deepEqual(await imported, { ok: true, type: "import-complete", count: 1, created: 1, replaced: undefined, warnings: [] });
+  } finally {
+    await bridge.close();
+  }
+});
+
+test("figma_export asks the plugin for a page or one layer", async () => {
+  const port = 19100 + Math.floor(Math.random() * 1000);
+  const bridge = new FigmaBridge({ port, connectTimeoutMs: 100, jobTimeoutMs: 500 });
+  const runner = createToolRunner(bridge);
+  await bridge.listen();
+  try {
+    const poll = fetch(`http://localhost:${port}/poll?wait=400`);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const exported = runner("figma_export", { scope: "page", id: "home" });
+    const job = await (await poll).json() as { id: string; type: string; scope: string; targetId: string };
+    assert.equal(job.type, "export");
+    assert.equal(job.scope, "page");
+    assert.equal(job.targetId, "home");
+    await fetch(`http://localhost:${port}/result`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: job.id, message: { type: "export-complete", document: { canvas: { id: "home" } }, warnings: [] } })
+    });
+    const payload = await exported;
+    assert.equal(payload.isError, false);
+    assert.match(payload.content[0].text, /"home"/);
+  } finally {
+    await bridge.close();
+  }
+});
+
+test("stdio writes newline-delimited JSON, not LSP Content-Length frames", () => {
+  const line = encodeStdioMessage({ jsonrpc: "2.0", id: 1, result: { ok: true } });
+  assert.equal(line.startsWith("{"), true);
+  assert.equal(line.endsWith("\n"), true);
+  assert.doesNotMatch(line, /Content-Length/i);
+  assert.deepEqual(JSON.parse(line), { jsonrpc: "2.0", id: 1, result: { ok: true } });
+});
+
+test("get_language covers insert and move patch operations", async () => {
+  const response = await rpc("tools/call", { name: "get_language", arguments: {} });
+  const guide = toolText(response);
+  assert.match(guide, /"op": "insert"/);
+  assert.match(guide, /"op": "move"/);
+  assert.match(guide, /after removal/);
+  assert.match(guide, /clamped to children\.length/);
+  const patchTool = TOOLS.find((tool) => tool.name === "figma_patch");
+  assert.ok(patchTool);
+  assert.match(patchTool!.description, /insert/);
+  assert.match(patchTool!.description, /move/);
+});
+
+test("patch set semantics: guide and tool describe merge/replace/errors, and validate/figma_patch reject typo keys before Figma", async () => {
+  const guide = toolText(await rpc("tools/call", { name: "get_language", arguments: {} }));
+  assert.match(guide, /Unknown keys are ERRORs/);
+  assert.match(guide, /keeps direction and padding/);
+  assert.match(guide, /parent-relative/);
+  assert.match(guide, /Not patchable yet/);
+  assert.doesNotMatch(guide, /preserves all properties/);
+  const patchTool = TOOLS.find((tool) => tool.name === "figma_patch")!;
+  assert.match(patchTool.description, /deep-merge/);
+  assert.match(patchTool.description, /errors, never ignored/);
+  const typo = { patch: { operations: [{ op: "set", id: "title", set: { txet: "Hi" } }] } };
+  const validated = await rpc("tools/call", { name: "validate", arguments: { document: typo } });
+  assert.equal((validated?.result as { isError?: boolean }).isError, true);
+  assert.equal(JSON.parse(toolText(validated)).valid, false);
+  const patched = await rpc("tools/call", { name: "figma_patch", arguments: { document: typo } });
+  const payload = JSON.parse(toolText(patched)) as { patched: boolean; issues: Array<{ path: string }> };
+  assert.equal(payload.patched, false, "rejected before reaching the (absent) plugin");
+  assert.ok(payload.issues.some((issue) => /txet/.test(issue.path) || /txet/.test(JSON.stringify(issue))));
+  const deferred = { patch: { operations: [{ op: "set", id: "title", set: { componentId: "x" } }] } };
+  const deferredResult = JSON.parse(toolText(await rpc("tools/call", { name: "figma_patch", arguments: { document: deferred } })));
+  assert.equal(deferredResult.patched, false);
+  // prototype is now replace-patchable (validate accepts shape; apply needs a real target doc).
+  const proto = { patch: { operations: [{ op: "set", id: "title", set: { prototype: [] } }] } };
+  assert.equal(JSON.parse(toolText(await rpc("tools/call", { name: "validate", arguments: { document: proto } }))).valid, true);
+});
+
+test("LANGUAGE_GUIDE and figma_patch describe token upsert on patches", () => {
+  assert.match(LANGUAGE_GUIDE, /upserted before operations/);
+  assert.match(LANGUAGE_GUIDE, /Mode 0 is never renamed/);
+  const patchTool = TOOLS.find((tool) => tool.name === "figma_patch");
+  assert.ok(patchTool);
+  assert.match(patchTool!.description, /variables\/styles/);
+  assert.match(patchTool!.description, /upserted before operations/);
+});
+

@@ -1,0 +1,31 @@
+{
+  "name": "@compact-design/html",
+  "version": "1.0.0",
+  "private": true,
+  "description": "HTML and CSS renderer for Compact Design JSON.",
+  "license": "MPL-2.0",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node scripts/test.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "node scripts/lint.mjs",
+    "render": "node scripts/render.mjs"
+  },
+  "dependencies": {
+    "@compact-design/core": "1.0.0"
+  }
+}

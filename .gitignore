@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.DS_Store
+.test-dist/
+packages/core/src/generated-schema.ts
+packages/core/LICENSE
+packages/html/LICENSE
+packages/mcp/LICENSE

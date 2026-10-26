@@ -1,0 +1,1324 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://compact-design-json.dev/schema.json",
+  "title": "Compact Design JSON",
+  "description": "The current public input language for the Compact Design Importer.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": { "type": "string" },
+    "canvas": { "$ref": "#/$defs/canvas" },
+    "canvases": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/responsiveCanvas" } },
+    "nodes": { "$ref": "#/$defs/nodes" },
+    "variables": { "type": "array", "items": { "$ref": "#/$defs/variableCollection" } },
+    "styles": { "type": "array", "items": { "$ref": "#/$defs/style" } },
+    "patch": { "$ref": "#/$defs/patchRoot" }
+  },
+  "oneOf": [
+    {
+      "required": ["canvas"],
+      "not": { "anyOf": [{ "required": ["canvases"] }, { "required": ["patch"] }] }
+    },
+    {
+      "required": ["canvases"],
+      "not": { "anyOf": [{ "required": ["canvas"] }, { "required": ["patch"] }] }
+    },
+    {
+      "required": ["patch"],
+      "not": { "anyOf": [{ "required": ["canvas"] }, { "required": ["canvases"] }, { "required": ["nodes"] }] }
+    }
+  ],
+  "$defs": {
+    "positiveNumber": { "type": "number", "exclusiveMinimum": 0 },
+    "nonNegativeNumber": { "type": "number", "minimum": 0 },
+    "nullablePositiveNumber": { "type": ["number", "null"], "exclusiveMinimum": 0 },
+    "hexColor": { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}([0-9A-Fa-f]{2})?$" },
+    "color": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["r", "g", "b"],
+      "properties": {
+        "r": { "type": "number", "minimum": 0, "maximum": 255 },
+        "g": { "type": "number", "minimum": 0, "maximum": 255 },
+        "b": { "type": "number", "minimum": 0, "maximum": 255 },
+        "a": { "type": "number", "minimum": 0, "maximum": 1 }
+      }
+    },
+    "vector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x", "y"],
+      "properties": { "x": { "type": "number" }, "y": { "type": "number" } }
+    },
+    "transform": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "items": { "type": "array", "minItems": 3, "maxItems": 3, "items": { "type": "number" } }
+    },
+    "gradientStop": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["at", "color"],
+      "properties": {
+        "at": { "type": "number", "minimum": 0, "maximum": 1 },
+        "color": { "oneOf": [{ "$ref": "#/$defs/hexColor" }, { "$ref": "#/$defs/color" }] }
+      }
+    },
+    "imagePaint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["image"],
+      "properties": {
+        "image": {
+          "type": "string",
+          "anyOf": [
+            { "pattern": "^https://" },
+            { "pattern": "^file:[^/].+" },
+            { "pattern": "^data:image/(png|jpeg|gif|webp);base64," }
+          ]
+        },
+        "fit": { "enum": ["COVER", "CONTAIN", "CROP", "TILE", "FILL", "FIT"] },
+        "opacity": { "type": "number", "minimum": 0, "maximum": 1 },
+        "transform": { "$ref": "#/$defs/transform" }
+      }
+    },
+    "gradientPaint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["gradient", "stops"],
+      "properties": {
+        "gradient": { "enum": ["LINEAR", "RADIAL", "ANGULAR", "DIAMOND"] },
+        "angle": { "type": "number" },
+        "transform": { "$ref": "#/$defs/transform" },
+        "stops": { "type": "array", "minItems": 2, "items": { "$ref": "#/$defs/gradientStop" } },
+        "opacity": { "type": "number", "minimum": 0, "maximum": 1 }
+      }
+    },
+    "solidPaint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "color"],
+      "properties": {
+        "type": { "const": "SOLID" },
+        "color": { "$ref": "#/$defs/color" },
+        "opacity": { "type": "number", "minimum": 0, "maximum": 1 },
+        "visible": { "type": "boolean" },
+        "blendMode": { "type": "string" }
+      }
+    },
+    "nativeGradientStop": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["position", "color"],
+      "properties": {
+        "position": { "type": "number", "minimum": 0, "maximum": 1 },
+        "color": { "$ref": "#/$defs/color" }
+      }
+    },
+    "nativeGradientPaint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "gradientStops"],
+      "properties": {
+        "type": {
+          "enum": ["GRADIENT_LINEAR", "GRADIENT_RADIAL", "GRADIENT_ANGULAR", "GRADIENT_DIAMOND"]
+        },
+        "gradientTransform": { "$ref": "#/$defs/transform" },
+        "gradientStops": {
+          "type": "array",
+          "minItems": 2,
+          "items": { "$ref": "#/$defs/nativeGradientStop" }
+        },
+        "opacity": { "type": "number", "minimum": 0, "maximum": 1 },
+        "visible": { "type": "boolean" },
+        "blendMode": { "type": "string" }
+      }
+    },
+    "paint": {
+      "oneOf": [
+        { "$ref": "#/$defs/hexColor" },
+        { "$ref": "#/$defs/imagePaint" },
+        { "$ref": "#/$defs/gradientPaint" },
+        { "$ref": "#/$defs/solidPaint" },
+        { "$ref": "#/$defs/nativeGradientPaint" }
+      ]
+    },
+    "font": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "family": { "type": "string", "minLength": 1 },
+        "style": { "type": "string", "minLength": 1 },
+        "size": { "$ref": "#/$defs/positiveNumber" }
+      }
+    },
+    "letterSpacing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["unit", "value"],
+      "properties": { "unit": { "enum": ["PIXELS", "PERCENT"] }, "value": { "type": "number" } }
+    },
+    "lineHeightObject": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["unit"],
+      "properties": {
+        "unit": { "enum": ["PIXELS", "PERCENT", "AUTO"] },
+        "value": { "type": "number" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "unit": { "const": "AUTO" } } },
+          "then": { "not": { "required": ["value"] } },
+          "else": { "required": ["value"] }
+        }
+      ]
+    },
+    "textRun": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "text": { "type": "string" },
+        "start": { "type": "integer", "minimum": 0 },
+        "end": { "type": "integer", "minimum": 0 },
+        "font": { "$ref": "#/$defs/font" },
+        "fill": { "$ref": "#/$defs/paint" },
+        "letterSpacing": { "$ref": "#/$defs/letterSpacing" },
+        "textDecoration": { "enum": ["NONE", "UNDERLINE", "STRIKETHROUGH"] },
+        "link": { "type": "string" }
+      },
+      "anyOf": [{ "required": ["text"] }, { "required": ["start", "end"] }]
+    },
+    "padding": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "left": { "$ref": "#/$defs/nonNegativeNumber" },
+        "top": { "$ref": "#/$defs/nonNegativeNumber" },
+        "right": { "$ref": "#/$defs/nonNegativeNumber" },
+        "bottom": { "$ref": "#/$defs/nonNegativeNumber" }
+      }
+    },
+    "layout": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["direction"],
+      "properties": {
+        "direction": { "enum": ["HORIZONTAL", "VERTICAL", "GRID"] },
+        "itemSpacing": { "type": "number" },
+        "counterAxisSpacing": { "type": "number" },
+        "padding": { "$ref": "#/$defs/padding" },
+        "primaryAxisAlignItems": { "enum": ["MIN", "MAX", "CENTER", "SPACE_BETWEEN"] },
+        "counterAxisAlignItems": { "enum": ["MIN", "MAX", "CENTER", "BASELINE", "STRETCH"] },
+        "primaryAxisSizingMode": { "enum": ["FIXED", "HUG", "AUTO"] },
+        "counterAxisSizingMode": { "enum": ["FIXED", "HUG", "AUTO"] },
+        "wrap": { "type": "boolean" }
+      }
+    },
+    "constraints": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["horizontal", "vertical"],
+      "properties": {
+        "horizontal": { "enum": ["MIN", "CENTER", "MAX", "STRETCH", "SCALE"] },
+        "vertical": { "enum": ["MIN", "CENTER", "MAX", "STRETCH", "SCALE"] }
+      }
+    },
+    "effect": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type"],
+      "properties": {
+        "type": { "enum": ["DROP_SHADOW", "INNER_SHADOW", "LAYER_BLUR", "BACKGROUND_BLUR", "NOISE", "TEXTURE", "GLASS", "SHADER"] },
+        "color": { "oneOf": [{ "$ref": "#/$defs/hexColor" }, { "$ref": "#/$defs/color" }] },
+        "offset": { "$ref": "#/$defs/vector" },
+        "blur": { "$ref": "#/$defs/nonNegativeNumber" },
+        "radius": { "$ref": "#/$defs/nonNegativeNumber" },
+        "spread": { "type": "number" },
+        "visible": { "type": "boolean" },
+        "blendMode": { "type": "string" },
+        "showShadowBehindNode": { "type": "boolean" },
+        "blurType": { "enum": ["NORMAL", "PROGRESSIVE"] },
+        "startRadius": { "$ref": "#/$defs/nonNegativeNumber" },
+        "startOffset": { "$ref": "#/$defs/vector" },
+        "endOffset": { "$ref": "#/$defs/vector" },
+        "noiseType": { "enum": ["MONOTONE", "DUOTONE", "MULTITONE"] },
+        "noiseSize": { "$ref": "#/$defs/nonNegativeNumber" },
+        "density": { "type": "number", "minimum": 0, "maximum": 1 },
+        "secondaryColor": { "oneOf": [{ "$ref": "#/$defs/hexColor" }, { "$ref": "#/$defs/color" }] },
+        "opacity": { "type": "number", "minimum": 0, "maximum": 1 },
+        "clipToShape": { "type": "boolean" },
+        "lightIntensity": { "type": "number", "minimum": 0, "maximum": 1 },
+        "lightAngle": { "type": "number" },
+        "refraction": { "type": "number", "minimum": 0, "maximum": 1 },
+        "depth": { "type": "number", "minimum": 1 },
+        "dispersion": { "type": "number", "minimum": 0, "maximum": 1 },
+        "id": { "type": "string", "minLength": 1 },
+        "properties": {
+          "type": "object",
+          "description": "SHADER property assignments keyed by Figma property-definition id. Values pass through verbatim (numbers, booleans, strings, colors, points, gradients, or variable aliases).",
+          "additionalProperties": { "type": ["boolean", "string", "number", "object"] }
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "type": { "const": "SHADER" } }, "required": ["type"] },
+          "then": { "required": ["id"] }
+        }
+      ]
+    },
+    "shadow": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "x": { "type": "number" },
+        "y": { "type": "number" },
+        "blur": { "$ref": "#/$defs/nonNegativeNumber" },
+        "spread": { "type": "number" },
+        "color": { "$ref": "#/$defs/hexColor" },
+        "inner": { "type": "boolean" }
+      }
+    },
+    "gridColor": { "$ref": "#/$defs/color" },
+    "grid": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["pattern", "sectionSize"],
+          "properties": {
+            "pattern": { "const": "GRID" },
+            "sectionSize": { "$ref": "#/$defs/positiveNumber" },
+            "color": { "$ref": "#/$defs/gridColor" },
+            "visible": { "type": "boolean" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["pattern", "alignment", "count", "gutterSize"],
+          "properties": {
+            "pattern": { "enum": ["COLUMNS", "ROWS"] },
+            "alignment": { "enum": ["MIN", "MAX", "CENTER", "STRETCH"] },
+            "count": { "type": "integer", "minimum": 1 },
+            "gutterSize": { "$ref": "#/$defs/nonNegativeNumber" },
+            "offset": { "$ref": "#/$defs/nonNegativeNumber" },
+            "sectionSize": { "$ref": "#/$defs/positiveNumber" },
+            "color": { "$ref": "#/$defs/gridColor" },
+            "visible": { "type": "boolean" }
+          },
+          "allOf": [
+            {
+              "if": { "properties": { "alignment": { "const": "STRETCH" } } },
+              "then": { "not": { "required": ["sectionSize"] } },
+              "else": { "required": ["sectionSize"] }
+            }
+          ]
+        }
+      ]
+    },
+    "easing": {
+      "oneOf": [
+        {
+          "enum": [
+            "EASE_IN",
+            "EASE_OUT",
+            "EASE_IN_AND_OUT",
+            "LINEAR",
+            "EASE_IN_BACK",
+            "EASE_OUT_BACK",
+            "EASE_IN_AND_OUT_BACK",
+            "GENTLE",
+            "QUICK",
+            "BOUNCY",
+            "SLOW"
+          ]
+        },
+        {
+          "type": "object",
+          "required": ["type"],
+          "properties": {
+            "type": { "type": "string" },
+            "easingFunctionCubicBezier": { "type": "object" },
+            "easingFunctionSpring": { "type": "object" }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "transition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type"],
+      "properties": {
+        "type": {
+          "enum": [
+            "INSTANT",
+            "DISSOLVE",
+            "SMART_ANIMATE",
+            "SCROLL_ANIMATE",
+            "MOVE_IN",
+            "MOVE_OUT",
+            "PUSH",
+            "SLIDE_IN",
+            "SLIDE_OUT"
+          ]
+        },
+        "easing": { "$ref": "#/$defs/easing" },
+        "duration": { "$ref": "#/$defs/nonNegativeNumber" },
+        "direction": { "enum": ["LEFT", "RIGHT", "TOP", "BOTTOM"] },
+        "matchLayers": { "type": "boolean" }
+      }
+    },
+    "trigger": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type"],
+      "properties": {
+        "type": {
+          "enum": [
+            "ON_CLICK",
+            "ON_HOVER",
+            "ON_PRESS",
+            "ON_DRAG",
+            "AFTER_TIMEOUT",
+            "MOUSE_UP",
+            "MOUSE_DOWN",
+            "MOUSE_ENTER",
+            "MOUSE_LEAVE",
+            "ON_KEY_DOWN",
+            "ON_MEDIA_HIT",
+            "ON_MEDIA_END"
+          ]
+        },
+        "timeout": { "$ref": "#/$defs/nonNegativeNumber" },
+        "delay": { "$ref": "#/$defs/nonNegativeNumber" },
+        "deprecatedVersion": { "type": "boolean" },
+        "device": { "enum": ["KEYBOARD", "XBOX_ONE", "PS4", "SWITCH_PRO", "UNKNOWN_CONTROLLER"] },
+        "keyCodes": { "type": "array", "items": { "type": "integer", "minimum": 0 } },
+        "mediaHitTime": { "$ref": "#/$defs/nonNegativeNumber" }
+      }
+    },
+    "variableData": {
+      "oneOf": [
+        { "type": ["boolean", "number", "string"] },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["variable"],
+          "properties": { "variable": { "type": "string" } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["function", "arguments"],
+          "properties": {
+            "function": {
+              "enum": [
+                "ADDITION",
+                "SUBTRACTION",
+                "MULTIPLICATION",
+                "DIVISION",
+                "EQUALS",
+                "NOT_EQUAL",
+                "LESS_THAN",
+                "LESS_THAN_OR_EQUAL",
+                "GREATER_THAN",
+                "GREATER_THAN_OR_EQUAL",
+                "AND",
+                "OR",
+                "VAR_MODE_LOOKUP",
+                "NEGATE",
+                "NOT"
+              ]
+            },
+            "resolvedType": { "enum": ["BOOLEAN", "COLOR", "FLOAT", "STRING"] },
+            "arguments": { "type": "array", "items": { "$ref": "#/$defs/variableData" } }
+          }
+        }
+      ]
+    },
+    "prototypeAction": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "destination"],
+          "properties": {
+            "type": { "enum": ["NAVIGATE", "SWAP", "OVERLAY", "SCROLL_TO", "CHANGE_TO"] },
+            "destination": { "type": "string" },
+            "transition": { "$ref": "#/$defs/transition" },
+            "overlayRelativePosition": { "$ref": "#/$defs/vector" },
+            "resetVideoPosition": { "type": "boolean" },
+            "resetScrollPosition": { "type": "boolean" },
+            "resetInteractiveComponents": { "type": "boolean" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type"],
+          "properties": { "type": { "enum": ["BACK", "CLOSE"] } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "url"],
+          "properties": {
+            "type": { "const": "URL" },
+            "url": { "type": "string", "minLength": 1 },
+            "openInNewTab": { "type": "boolean" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "mediaAction"],
+          "properties": {
+            "type": { "const": "UPDATE_MEDIA_RUNTIME" },
+            "destination": { "type": "string" },
+            "mediaAction": {
+              "enum": [
+                "PLAY",
+                "PAUSE",
+                "TOGGLE_PLAY_PAUSE",
+                "MUTE",
+                "UNMUTE",
+                "TOGGLE_MUTE_UNMUTE",
+                "SKIP_FORWARD",
+                "SKIP_BACKWARD",
+                "SKIP_TO"
+              ]
+            },
+            "amountToSkip": { "$ref": "#/$defs/nonNegativeNumber" },
+            "newTimestamp": { "$ref": "#/$defs/nonNegativeNumber" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "variable", "value"],
+          "properties": {
+            "type": { "const": "SET_VARIABLE" },
+            "variable": { "type": "string" },
+            "value": { "$ref": "#/$defs/variableData" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "collection", "mode"],
+          "properties": {
+            "type": { "const": "SET_VARIABLE_MODE" },
+            "collection": { "type": "string" },
+            "mode": { "type": "string" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "blocks"],
+          "properties": {
+            "type": { "const": "CONDITIONAL" },
+            "blocks": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "$ref": "#/$defs/conditionalBlock" }
+            }
+          }
+        }
+      ]
+    },
+    "conditionalBlock": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["actions"],
+      "properties": {
+        "condition": { "$ref": "#/$defs/variableData" },
+        "actions": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/prototypeAction" }
+        }
+      }
+    },
+    "prototype": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["trigger", "actions"],
+      "properties": {
+        "trigger": { "$ref": "#/$defs/trigger" },
+        "actions": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/prototypeAction" }
+        }
+      }
+    },
+    "componentProperty": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "type", "defaultValue"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "type": { "enum": ["TEXT", "BOOLEAN", "INSTANCE_SWAP"] },
+        "defaultValue": {},
+        "options": { "type": "object" }
+      }
+    },
+    "componentPropertyReferences": {
+      "type": "object",
+      "description": "Links this child layer to component properties on its nearest ancestor COMPONENT (Figma componentPropertyReferences). Values are the authored property names from that COMPONENT's componentProperties. characters → TEXT (TEXT nodes only); visible → BOOLEAN (any node); mainComponent → INSTANCE_SWAP (INSTANCE nodes only).",
+      "additionalProperties": false,
+      "properties": {
+        "characters": { "type": "string", "minLength": 1 },
+        "visible": { "type": "string", "minLength": 1 },
+        "mainComponent": { "type": "string", "minLength": 1 }
+      }
+    },
+    "componentPropertyReferencesPatch": {
+      "type": "object",
+      "description": "Patch form of componentPropertyReferences: null field clears that link.",
+      "additionalProperties": false,
+      "properties": {
+        "characters": { "type": ["string", "null"], "minLength": 1 },
+        "visible": { "type": ["string", "null"], "minLength": 1 },
+        "mainComponent": { "type": ["string", "null"], "minLength": 1 }
+      }
+    },
+    "vectorPath": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["data"],
+      "properties": {
+        "windingRule": { "enum": ["NONZERO", "EVENODD", "NONE"] },
+        "data": { "type": "string", "minLength": 1 }
+      }
+    },
+    "node": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["w", "h"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "name": { "type": "string" },
+        "type": {
+          "enum": [
+            "FRAME",
+            "GROUP",
+            "RECTANGLE",
+            "ELLIPSE",
+            "ARC",
+            "LINE",
+            "POLYGON",
+            "STAR",
+            "SECTION",
+            "SLICE",
+            "TEXT",
+            "SVG",
+            "VECTOR",
+            "COMPONENT",
+            "COMPONENT_SET",
+            "INSTANCE",
+            "BOOLEAN_OPERATION"
+          ]
+        },
+        "x": { "type": "number" },
+        "y": { "type": "number" },
+        "w": { "$ref": "#/$defs/positiveNumber" },
+        "h": { "$ref": "#/$defs/positiveNumber" },
+        "coordinateMode": { "enum": ["RELATIVE", "ABSOLUTE"] },
+        "rotation": { "type": "number" },
+        "fill": { "$ref": "#/$defs/paint" },
+        "fills": { "type": "array", "items": { "$ref": "#/$defs/paint" } },
+        "stroke": { "$ref": "#/$defs/paint" },
+        "strokes": { "type": "array", "items": { "$ref": "#/$defs/paint" } },
+        "strokeWeight": { "$ref": "#/$defs/nonNegativeNumber" },
+        "strokeTopWeight": { "$ref": "#/$defs/nonNegativeNumber" },
+        "strokeRightWeight": { "$ref": "#/$defs/nonNegativeNumber" },
+        "strokeBottomWeight": { "$ref": "#/$defs/nonNegativeNumber" },
+        "strokeLeftWeight": { "$ref": "#/$defs/nonNegativeNumber" },
+        "strokeAlign": { "enum": ["CENTER", "INSIDE", "OUTSIDE"] },
+        "strokeCap": {
+          "enum": [
+            "NONE",
+            "ROUND",
+            "SQUARE",
+            "LINE_ARROW",
+            "TRIANGLE_ARROW",
+            "DIAMOND_FILLED",
+            "CIRCLE_FILLED",
+            "TRIANGLE_FILLED",
+            "WASHI_TAPE_1",
+            "WASHI_TAPE_2",
+            "WASHI_TAPE_3",
+            "WASHI_TAPE_4",
+            "WASHI_TAPE_5",
+            "WASHI_TAPE_6"
+          ]
+        },
+        "strokeJoin": { "enum": ["MITER", "BEVEL", "ROUND"] },
+        "dashPattern": { "type": "array", "items": { "$ref": "#/$defs/nonNegativeNumber" } },
+        "cornerRadius": { "$ref": "#/$defs/nonNegativeNumber" },
+        "cornerRadii": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "items": { "$ref": "#/$defs/nonNegativeNumber" }
+        },
+        "opacity": { "type": "number", "minimum": 0, "maximum": 1 },
+        "blendMode": { "type": "string" },
+        "visible": { "type": "boolean" },
+        "locked": { "type": "boolean" },
+        "isMask": { "type": "boolean" },
+        "clipsContent": { "type": "boolean" },
+        "effects": { "type": "array", "items": { "$ref": "#/$defs/effect" } },
+        "elevation": { "enum": ["NONE", "LOW", "MEDIUM", "HIGH", "FLOATING"] },
+        "shadow": {
+          "oneOf": [
+            { "$ref": "#/$defs/shadow" },
+            { "type": "array", "items": { "$ref": "#/$defs/shadow" } }
+          ]
+        },
+        "children": { "$ref": "#/$defs/nodes" },
+        "layout": { "$ref": "#/$defs/layout" },
+        "constraints": { "$ref": "#/$defs/constraints" },
+        "layoutSizingHorizontal": { "enum": ["FIXED", "HUG", "FILL"] },
+        "layoutSizingVertical": { "enum": ["FIXED", "HUG", "FILL"] },
+        "layoutAlign": { "enum": ["INHERIT", "STRETCH"] },
+        "layoutGrow": { "type": "number", "minimum": 0 },
+        "layoutPositioning": { "enum": ["AUTO", "ABSOLUTE"] },
+        "minWidth": { "$ref": "#/$defs/nullablePositiveNumber" },
+        "maxWidth": { "$ref": "#/$defs/nullablePositiveNumber" },
+        "minHeight": { "$ref": "#/$defs/nullablePositiveNumber" },
+        "maxHeight": { "$ref": "#/$defs/nullablePositiveNumber" },
+        "layoutGrids": { "type": "array", "items": { "$ref": "#/$defs/grid" } },
+        "text": { "type": "string" },
+        "font": { "$ref": "#/$defs/font" },
+        "lineHeight": {
+          "oneOf": [
+            { "type": "number", "exclusiveMinimum": 0 },
+            { "$ref": "#/$defs/lineHeightObject" }
+          ]
+        },
+        "letterSpacing": { "$ref": "#/$defs/letterSpacing" },
+        "align": { "enum": ["LEFT", "CENTER", "RIGHT", "JUSTIFIED"] },
+        "verticalAlignment": { "enum": ["TOP", "CENTER", "BOTTOM"] },
+        "textDecoration": { "enum": ["NONE", "UNDERLINE", "STRIKETHROUGH"] },
+        "textCase": {
+          "enum": ["ORIGINAL", "UPPER", "LOWER", "TITLE", "SMALL_CAPS", "SMALL_CAPS_FORCED"]
+        },
+        "paragraphSpacing": { "$ref": "#/$defs/nonNegativeNumber" },
+        "paragraphIndent": { "$ref": "#/$defs/nonNegativeNumber" },
+        "listSpacing": { "$ref": "#/$defs/nonNegativeNumber" },
+        "hangingPunctuation": { "type": "boolean" },
+        "hangingList": { "type": "boolean" },
+        "textAutoResize": { "enum": ["NONE", "WIDTH_AND_HEIGHT", "HEIGHT", "TRUNCATE"] },
+        "textTruncation": { "enum": ["DISABLED", "ENDING"] },
+        "maxLines": { "type": ["integer", "null"], "minimum": 1 },
+        "runs": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/textRun" } },
+        "pointCount": { "type": "integer", "minimum": 3 },
+        "innerRadius": { "type": "number", "minimum": 0, "maximum": 1 },
+        "startingAngle": { "type": "number" },
+        "endingAngle": { "type": "number" },
+        "innerRadiusRatio": { "type": "number", "minimum": 0, "maximum": 1 },
+        "svg": { "type": "string", "minLength": 1 },
+        "vectorPaths": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/vectorPath" }
+        },
+        "componentId": { "type": "string", "minLength": 1 },
+        "componentProperties": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/componentProperty" }
+        },
+        "instanceProperties": { "type": "object" },
+        "componentPropertyReferences": { "$ref": "#/$defs/componentPropertyReferences" },
+        "variantAxes": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string" },
+            "uniqueItems": true
+          }
+        },
+        "variant": { "type": "object", "additionalProperties": { "type": "string" } },
+        "operation": { "enum": ["UNION", "SUBTRACT", "INTERSECT", "EXCLUDE"] },
+        "prototype": { "type": "array", "items": { "$ref": "#/$defs/prototype" } },
+        "overflowDirection": {
+          "enum": [
+            "NONE",
+            "HORIZONTAL",
+            "VERTICAL",
+            "BOTH",
+            "HORIZONTAL_SCROLLING",
+            "VERTICAL_SCROLLING",
+            "HORIZONTAL_AND_VERTICAL_SCROLLING"
+          ]
+        },
+        "numberOfFixedChildren": { "type": "integer", "minimum": 0 },
+        "styleRefs": { "type": "object", "additionalProperties": { "type": "string" } },
+        "bindings": { "type": "object", "additionalProperties": { "type": "string" } },
+        "variableModes": { "type": "object", "additionalProperties": { "type": "string" } }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "type": { "const": "TEXT" } }, "required": ["type"] },
+          "then": { "anyOf": [{ "required": ["text"] }, { "required": ["runs"] }] }
+        },
+        {
+          "if": { "properties": { "type": { "const": "SVG" } }, "required": ["type"] },
+          "then": { "required": ["svg"] }
+        },
+        {
+          "if": { "properties": { "type": { "const": "VECTOR" } }, "required": ["type"] },
+          "then": { "required": ["vectorPaths"] }
+        },
+        {
+          "if": { "properties": { "type": { "const": "INSTANCE" } }, "required": ["type"] },
+          "then": { "required": ["componentId"] }
+        },
+        {
+          "if": {
+            "properties": { "type": { "enum": ["GROUP", "BOOLEAN_OPERATION", "COMPONENT_SET"] } },
+            "required": ["type"]
+          },
+          "then": { "required": ["children"], "properties": { "children": { "minItems": 1 } } }
+        },
+        {
+          "if": { "properties": { "type": { "const": "POLYGON" } }, "required": ["type"] },
+          "then": { "required": ["pointCount"] }
+        },
+        {
+          "if": { "properties": { "type": { "const": "STAR" } }, "required": ["type"] },
+          "then": { "required": ["pointCount", "innerRadius"] }
+        },
+        {
+          "if": { "properties": { "type": { "const": "ARC" } }, "required": ["type"] },
+          "then": { "required": ["startingAngle", "endingAngle", "innerRadiusRatio"] }
+        }
+      ]
+    },
+    "nodes": { "type": "array", "items": { "$ref": "#/$defs/node" } },
+    "breakpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "minWidth": { "$ref": "#/$defs/nonNegativeNumber" },
+        "maxWidth": { "$ref": "#/$defs/nonNegativeNumber" }
+      }
+    },
+    "canvas": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["width", "height"],
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "x": { "type": "number" },
+        "y": { "type": "number" },
+        "width": { "$ref": "#/$defs/positiveNumber" },
+        "height": { "$ref": "#/$defs/positiveNumber" },
+        "fill": { "$ref": "#/$defs/paint" },
+        "cornerRadius": { "$ref": "#/$defs/nonNegativeNumber" },
+        "clipsContent": { "type": "boolean" },
+        "breakpoint": { "$ref": "#/$defs/breakpoint" },
+        "nodes": { "$ref": "#/$defs/nodes" }
+      }
+    },
+    "responsiveCanvas": { "$ref": "#/$defs/canvas" },
+    "tokenValue": {
+      "oneOf": [
+        { "$ref": "#/$defs/color" },
+        { "type": "number" },
+        { "type": "string" },
+        { "type": "boolean" }
+      ]
+    },
+    "variable": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "type"],
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string", "minLength": 1 },
+        "type": { "enum": ["COLOR", "FLOAT", "STRING", "BOOLEAN"] },
+        "value": { "$ref": "#/$defs/tokenValue" },
+        "values": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": { "$ref": "#/$defs/tokenValue" }
+        }
+      },
+      "anyOf": [{ "required": ["value"] }, { "required": ["values"] }],
+      "allOf": [
+        {
+          "if": { "properties": { "type": { "const": "COLOR" } } },
+          "then": {
+            "properties": {
+              "value": { "$ref": "#/$defs/color" },
+              "values": { "type": "object", "additionalProperties": { "$ref": "#/$defs/color" } }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "FLOAT" } } },
+          "then": {
+            "properties": {
+              "value": { "type": "number" },
+              "values": { "type": "object", "additionalProperties": { "type": "number" } }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "STRING" } } },
+          "then": {
+            "properties": {
+              "value": { "type": "string" },
+              "values": { "type": "object", "additionalProperties": { "type": "string" } }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "BOOLEAN" } } },
+          "then": {
+            "properties": {
+              "value": { "type": "boolean" },
+              "values": { "type": "object", "additionalProperties": { "type": "boolean" } }
+            }
+          }
+        }
+      ]
+    },
+    "variableCollection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "items"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "modes": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "items": { "type": "array", "items": { "$ref": "#/$defs/variable" } }
+      }
+    },
+    "paintStyle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name", "type", "paints"],
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "type": { "const": "PAINT" },
+        "paints": { "type": "array", "items": { "$ref": "#/$defs/paint" } }
+      }
+    },
+    "textStyle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name", "type", "font"],
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "type": { "const": "TEXT" },
+        "font": { "$ref": "#/$defs/font" },
+        "lineHeight": {
+          "oneOf": [
+            { "type": "number", "exclusiveMinimum": 0 },
+            { "$ref": "#/$defs/lineHeightObject" }
+          ]
+        },
+        "letterSpacing": { "$ref": "#/$defs/letterSpacing" },
+        "paragraphSpacing": { "$ref": "#/$defs/nonNegativeNumber" }
+      }
+    },
+    "style": { "oneOf": [{ "$ref": "#/$defs/paintStyle" }, { "$ref": "#/$defs/textStyle" }] },
+    "fontPatch": {
+      "description": "Partial font for patch set. Merges into the target's font: unmentioned family/style/size are kept.",
+      "allOf": [{ "$ref": "#/$defs/font" }],
+      "minProperties": 1
+    },
+    "paddingPatch": {
+      "description": "Partial padding for patch set. Merges per side into the target's padding.",
+      "allOf": [{ "$ref": "#/$defs/padding" }],
+      "minProperties": 1
+    },
+    "layoutPatch": {
+      "type": "object",
+      "description": "Partial Auto Layout for patch set. Deep-merges into the target's layout (padding merges per side). direction is required only when the target has no Auto Layout yet.",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "direction": { "enum": ["HORIZONTAL", "VERTICAL", "GRID"] },
+        "itemSpacing": { "type": "number" },
+        "counterAxisSpacing": { "type": "number" },
+        "padding": { "$ref": "#/$defs/paddingPatch" },
+        "primaryAxisAlignItems": { "enum": ["MIN", "MAX", "CENTER", "SPACE_BETWEEN"] },
+        "counterAxisAlignItems": { "enum": ["MIN", "MAX", "CENTER", "BASELINE"], "description": "STRETCH is not patchable yet; set layoutAlign: STRETCH on children." },
+        "primaryAxisSizingMode": { "enum": ["FIXED", "HUG", "AUTO"] },
+        "counterAxisSizingMode": { "enum": ["FIXED", "HUG", "AUTO"] },
+        "wrap": { "type": "boolean" }
+      }
+    },
+    "constraintsPatch": {
+      "type": "object",
+      "description": "Partial constraints for patch set. Merges into the target's constraints (missing axes default to MIN, Figma's default).",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "horizontal": { "enum": ["MIN", "CENTER", "MAX", "STRETCH", "SCALE"] },
+        "vertical": { "enum": ["MIN", "CENTER", "MAX", "STRETCH", "SCALE"] }
+      }
+    },
+    "patchSet": {
+      "type": "object",
+      "description": "Properties for a patch set operation. Derived from node properties minus id, type, children and coordinateMode. Unknown keys are rejected. x/y are parent-relative. Objects (layout, layout.padding, font, constraints) deep-merge; arrays (fills, strokes, effects, runs, layoutGrids, vectorPaths, dashPattern, cornerRadii) replace. font is partial (its fields merge).",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "name": { "type": "string" },
+        "x": { "type": "number" },
+        "y": { "type": "number" },
+        "w": { "$ref": "#/$defs/positiveNumber" },
+        "h": { "$ref": "#/$defs/positiveNumber" },
+        "rotation": { "type": "number" },
+        "fill": { "$ref": "#/$defs/paint" },
+        "fills": { "type": "array", "items": { "$ref": "#/$defs/paint" } },
+        "stroke": { "$ref": "#/$defs/paint" },
+        "strokes": { "type": "array", "items": { "$ref": "#/$defs/paint" } },
+        "strokeWeight": { "$ref": "#/$defs/nonNegativeNumber" },
+        "strokeTopWeight": { "$ref": "#/$defs/nonNegativeNumber" },
+        "strokeRightWeight": { "$ref": "#/$defs/nonNegativeNumber" },
+        "strokeBottomWeight": { "$ref": "#/$defs/nonNegativeNumber" },
+        "strokeLeftWeight": { "$ref": "#/$defs/nonNegativeNumber" },
+        "strokeAlign": { "enum": ["CENTER", "INSIDE", "OUTSIDE"] },
+        "strokeCap": { "enum": ["NONE", "ROUND", "SQUARE", "LINE_ARROW", "TRIANGLE_ARROW", "DIAMOND_FILLED", "CIRCLE_FILLED", "TRIANGLE_FILLED", "WASHI_TAPE_1", "WASHI_TAPE_2", "WASHI_TAPE_3", "WASHI_TAPE_4", "WASHI_TAPE_5", "WASHI_TAPE_6"] },
+        "strokeJoin": { "enum": ["MITER", "BEVEL", "ROUND"] },
+        "dashPattern": { "type": "array", "items": { "$ref": "#/$defs/nonNegativeNumber" } },
+        "cornerRadius": { "$ref": "#/$defs/nonNegativeNumber" },
+        "cornerRadii": { "type": "array", "minItems": 4, "maxItems": 4, "items": { "$ref": "#/$defs/nonNegativeNumber" } },
+        "opacity": { "type": "number", "minimum": 0, "maximum": 1 },
+        "blendMode": { "type": "string" },
+        "visible": { "type": "boolean" },
+        "locked": { "type": "boolean" },
+        "isMask": { "type": "boolean" },
+        "clipsContent": { "type": "boolean" },
+        "effects": { "type": "array", "items": { "$ref": "#/$defs/effect" } },
+        "elevation": { "enum": ["NONE", "LOW", "MEDIUM", "HIGH", "FLOATING"] },
+        "shadow": { "oneOf": [{ "$ref": "#/$defs/shadow" }, { "type": "array", "items": { "$ref": "#/$defs/shadow" } }] },
+        "layout": { "$ref": "#/$defs/layoutPatch" },
+        "constraints": { "$ref": "#/$defs/constraintsPatch" },
+        "layoutSizingHorizontal": { "enum": ["FIXED", "HUG", "FILL"] },
+        "layoutSizingVertical": { "enum": ["FIXED", "HUG", "FILL"] },
+        "layoutAlign": { "enum": ["INHERIT", "STRETCH"] },
+        "layoutGrow": { "type": "number", "minimum": 0 },
+        "layoutPositioning": { "enum": ["AUTO", "ABSOLUTE"] },
+        "minWidth": { "$ref": "#/$defs/nullablePositiveNumber" },
+        "maxWidth": { "$ref": "#/$defs/nullablePositiveNumber" },
+        "minHeight": { "$ref": "#/$defs/nullablePositiveNumber" },
+        "maxHeight": { "$ref": "#/$defs/nullablePositiveNumber" },
+        "layoutGrids": { "type": "array", "items": { "$ref": "#/$defs/grid" } },
+        "text": { "type": "string" },
+        "font": { "$ref": "#/$defs/fontPatch" },
+        "lineHeight": { "oneOf": [{ "type": "number", "exclusiveMinimum": 0 }, { "$ref": "#/$defs/lineHeightObject" }] },
+        "letterSpacing": { "$ref": "#/$defs/letterSpacing" },
+        "align": { "enum": ["LEFT", "CENTER", "RIGHT", "JUSTIFIED"] },
+        "verticalAlignment": { "enum": ["TOP", "CENTER", "BOTTOM"] },
+        "textDecoration": { "enum": ["NONE", "UNDERLINE", "STRIKETHROUGH"] },
+        "textCase": { "enum": ["ORIGINAL", "UPPER", "LOWER", "TITLE", "SMALL_CAPS", "SMALL_CAPS_FORCED"] },
+        "paragraphSpacing": { "$ref": "#/$defs/nonNegativeNumber" },
+        "paragraphIndent": { "$ref": "#/$defs/nonNegativeNumber" },
+        "listSpacing": { "$ref": "#/$defs/nonNegativeNumber" },
+        "hangingPunctuation": { "type": "boolean" },
+        "hangingList": { "type": "boolean" },
+        "textAutoResize": { "enum": ["NONE", "WIDTH_AND_HEIGHT", "HEIGHT", "TRUNCATE"] },
+        "textTruncation": { "enum": ["DISABLED", "ENDING"] },
+        "maxLines": { "type": ["integer", "null"], "minimum": 1 },
+        "runs": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/textRun" } },
+        "pointCount": { "type": "integer", "minimum": 3 },
+        "innerRadius": { "type": "number", "minimum": 0, "maximum": 1 },
+        "startingAngle": { "type": "number" },
+        "endingAngle": { "type": "number" },
+        "innerRadiusRatio": { "type": "number", "minimum": 0, "maximum": 1 },
+        "svg": { "type": "string", "minLength": 1, "description": "SVG markup cannot be patched in place: core and the Figma plugin reject it. Remove and insert a new SVG node." },
+        "vectorPaths": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/vectorPath" } },
+        "componentId": { "type": "string", "minLength": 1, "description": "Recognised but not patchable yet: core and the Figma plugin reject it with PATCH_SET_UNSUPPORTED. Re-import, or remove and insert the node." },
+        "componentProperties": {
+          "description": "Name-keyed upsert of COMPONENT property definitions (not a full wipe). Field null deletes a TEXT/BOOLEAN/INSTANCE_SWAP property. type is immutable after create. INSTANCE_SWAP defaultValue must be a COMPONENT id.",
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": {
+                "oneOf": [
+                  { "type": "null" },
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "type": { "enum": ["TEXT", "BOOLEAN", "INSTANCE_SWAP"] },
+                      "defaultValue": {},
+                      "options": { "type": "object" }
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "instanceProperties": { "description": "Shallow-merge instance overrides (authored names). Field null clears that override. Whole-key null clears all. INSTANCE_SWAP values must be COMPONENT ids.", "oneOf": [ { "type": "null" }, { "type": "object" } ] },
+        "componentPropertyReferences": { "description": "Shallow-merge onto the node. Field null clears that link. Whole-key null clears all refs. Values are authored property names on the owning COMPONENT.", "oneOf": [ { "type": "null" }, { "$ref": "#/$defs/componentPropertyReferencesPatch" } ] },
+        "variantAxes": {
+          "description": "Shallow-merge on COMPONENT_SET. A string array replaces that axis's options and NEVER renames. Object form { rename?, options?, renameOptions? } renames explicitly. Axis null is an error (Figma cannot delete VARIANT properties). Every declared option must be carried by a COMPONENT child after the patch (Figma derives options from child names).",
+          "type": "object",
+          "additionalProperties": {
+            "oneOf": [
+              { "type": "null" },
+              { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "rename": { "type": "string", "minLength": 1, "description": "Rename this axis to the given name." },
+                  "options": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 }, "uniqueItems": true, "description": "Final option list after renameOptions are applied." },
+                  "renameOptions": { "type": "object", "additionalProperties": { "type": "string", "minLength": 1 }, "description": "Explicit old→new option renames on this axis (after axis rename, if any)." }
+                }
+              }
+            ]
+          }
+        },
+        "variant": {
+          "description": "Merge variant selection on a COMPONENT inside a COMPONENT_SET. Every axis/value must be declared on the parent variantAxes. Rewrites the component name. Whole-key null and per-axis null are rejected (variant components require a selection).",
+          "oneOf": [
+            { "type": "null" },
+            { "type": "object", "additionalProperties": { "type": ["string", "null"], "minLength": 1 } }
+          ]
+        },
+        "operation": { "enum": ["UNION", "SUBTRACT", "INTERSECT", "EXCLUDE"] },
+        "prototype": { "type": "array", "items": { "$ref": "#/$defs/prototype" }, "description": "Replace the full reaction list (like runs/effects). [] clears. Destinations must exist (including ids created earlier in the same patch). NAVIGATE/SWAP/OVERLAY destinations must be top-level frames; AFTER_TIMEOUT only on a top-level target. No whole-key null." },
+        "overflowDirection": { "enum": ["NONE", "HORIZONTAL", "VERTICAL", "BOTH", "HORIZONTAL_SCROLLING", "VERTICAL_SCROLLING", "HORIZONTAL_AND_VERTICAL_SCROLLING"] },
+        "numberOfFixedChildren": { "type": "integer", "minimum": 0 },
+        "styleRefs": { "description": "Shallow-merge style refs. Field null clears that ref. Whole-key null clears all styleRefs.", "oneOf": [ { "type": "null" }, { "type": "object", "additionalProperties": { "type": ["string", "null"] } } ] },
+        "bindings": { "description": "Shallow-merge variable bindings. Field null clears that binding. Whole-key null clears all bindings.", "oneOf": [ { "type": "null" }, { "type": "object", "additionalProperties": { "type": ["string", "null"] } } ] },
+        "variableModes": { "description": "Shallow-merge collection→mode. Field null clears that collection mode. Whole-key null clears all.", "oneOf": [ { "type": "null" }, { "type": "object", "additionalProperties": { "type": ["string", "null"] } } ] }
+      },
+      "not": {
+        "anyOf": [
+          { "required": ["fill", "fills"] },
+          { "required": ["stroke", "strokes"] }
+        ]
+      }
+    },
+    "wrapNode": {
+      "description": "FRAME authored for patch wrap. w/h are optional: omitted sizes derive from the wrapped children's bounding box.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "name": { "type": "string" },
+        "type": { "const": "FRAME" },
+        "x": { "type": "number" },
+        "y": { "type": "number" },
+        "w": { "$ref": "#/$defs/positiveNumber" },
+        "h": { "$ref": "#/$defs/positiveNumber" },
+        "fill": { "$ref": "#/$defs/paint" },
+        "fills": { "type": "array", "items": { "$ref": "#/$defs/paint" } },
+        "stroke": { "$ref": "#/$defs/paint" },
+        "strokes": { "type": "array", "items": { "$ref": "#/$defs/paint" } },
+        "effects": { "type": "array", "items": { "$ref": "#/$defs/effect" } },
+        "elevation": { "enum": ["NONE", "LOW", "MEDIUM", "HIGH", "FLOATING"] },
+        "shadow": { "oneOf": [{ "$ref": "#/$defs/shadow" }, { "type": "array", "items": { "$ref": "#/$defs/shadow" } }] },
+        "cornerRadius": { "$ref": "#/$defs/nonNegativeNumber" },
+        "cornerRadii": { "type": "array", "minItems": 4, "maxItems": 4, "items": { "$ref": "#/$defs/nonNegativeNumber" } },
+        "opacity": { "type": "number", "minimum": 0, "maximum": 1 },
+        "blendMode": { "type": "string" },
+        "visible": { "type": "boolean" },
+        "locked": { "type": "boolean" },
+        "clipsContent": { "type": "boolean" },
+        "layout": { "$ref": "#/$defs/layout" },
+        "constraints": { "$ref": "#/$defs/constraints" },
+        "layoutSizingHorizontal": { "enum": ["FIXED", "HUG", "FILL"] },
+        "layoutSizingVertical": { "enum": ["FIXED", "HUG", "FILL"] },
+        "layoutAlign": { "enum": ["INHERIT", "STRETCH"] },
+        "layoutGrow": { "type": "number", "minimum": 0 },
+        "layoutPositioning": { "enum": ["AUTO", "ABSOLUTE"] },
+        "minWidth": { "$ref": "#/$defs/nullablePositiveNumber" },
+        "maxWidth": { "$ref": "#/$defs/nullablePositiveNumber" },
+        "minHeight": { "$ref": "#/$defs/nullablePositiveNumber" },
+        "maxHeight": { "$ref": "#/$defs/nullablePositiveNumber" },
+        "padding": { "$ref": "#/$defs/padding" },
+        "itemSpacing": { "type": "number" },
+        "styleRefs": { "type": "object", "additionalProperties": { "type": "string" } },
+        "bindings": { "type": "object", "additionalProperties": { "type": "string" } },
+        "variableModes": { "type": "object", "additionalProperties": { "type": "string" } },
+        "overflowDirection": { "enum": ["NONE", "HORIZONTAL", "VERTICAL", "BOTH", "HORIZONTAL_SCROLLING", "VERTICAL_SCROLLING", "HORIZONTAL_AND_VERTICAL_SCROLLING"] },
+        "numberOfFixedChildren": { "type": "integer", "minimum": 0 },
+        "layoutGrids": { "type": "array", "items": { "$ref": "#/$defs/grid" } },
+        "prototype": { "type": "array", "items": { "$ref": "#/$defs/prototype" } }
+      }
+    },
+    "patchOperation": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["op", "id", "set"],
+          "properties": {
+            "op": { "const": "set" },
+            "id": { "type": "string" },
+            "set": { "$ref": "#/$defs/patchSet" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["op", "id"],
+          "properties": { "op": { "const": "remove" }, "id": { "type": "string" } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["op", "parent", "node"],
+          "properties": {
+            "op": { "const": "append" },
+            "parent": { "type": "string" },
+            "node": { "$ref": "#/$defs/node" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["op", "parent", "index", "node"],
+          "properties": {
+            "op": { "const": "insert" },
+            "parent": { "type": "string" },
+            "index": { "type": "integer", "minimum": 0 },
+            "node": { "$ref": "#/$defs/node" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["op", "id", "parent", "index"],
+          "properties": {
+            "op": { "const": "move" },
+            "id": { "type": "string" },
+            "parent": { "type": "string" },
+            "index": { "type": "integer", "minimum": 0 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["op", "id", "idSuffix"],
+          "properties": {
+            "op": { "const": "duplicate" },
+            "id": { "type": "string", "minLength": 1, "description": "Source node to duplicate." },
+            "idSuffix": { "type": "string", "minLength": 1, "description": "Appended to every subtree id unless overridden in ids." },
+            "parent": { "type": "string", "minLength": 1, "description": "Optional new parent; omit to keep the source parent (or page-level for a top-level screen)." },
+            "index": { "type": "integer", "minimum": 0, "description": "Optional insert index; default is right after the source when same parent, else end." },
+            "ids": { "type": "object", "additionalProperties": { "type": "string", "minLength": 1 }, "description": "Optional sourceId→newId overrides. Keys must be ids within the source subtree." }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["op", "ids", "node"],
+          "properties": {
+            "op": { "const": "wrap" },
+            "ids": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "type": "string", "minLength": 1 },
+              "description": "Sibling ids to reparent into the new FRAME. Order becomes child order. Absolute positions are preserved when the wrapper has no Auto Layout direction."
+            },
+            "node": { "$ref": "#/$defs/wrapNode" },
+            "index": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Final index of the wrapper among remaining siblings after wrapped ids are removed. Default: pre-removal index of ids[0]."
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["op", "id"],
+          "properties": {
+            "op": { "const": "unwrap" },
+            "id": { "type": "string", "minLength": 1, "description": "FRAME or GROUP to dissolve. Children are promoted preserving absolute positions (or become AL flow items if the parent has Auto Layout)." }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["op", "id"],
+          "properties": {
+            "op": { "const": "componentize" },
+            "id": { "type": "string", "minLength": 1, "description": "FRAME to promote to COMPONENT in place (same id/parent/index/x/y/subtree)." },
+            "properties": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["type", "layer"],
+                "properties": {
+                  "type": { "enum": ["TEXT", "BOOLEAN", "INSTANCE_SWAP"] },
+                  "layer": { "type": "string", "minLength": 1, "description": "Descendant id of id that the property binds to." }
+                }
+              },
+              "description": "Property name → { type, layer }. Defaults are read from the source layer; wired via componentProperties + componentPropertyReferences."
+            },
+            "instances": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 },
+              "uniqueItems": true,
+              "description": "Detached FRAME copy ids replaced by INSTANCEs of id. Omit for promote-only. Copy w/h must equal the source."
+            }
+          }
+        }
+      ]
+    },
+    "patchRoot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operations"],
+      "properties": {
+        "operations": {
+          "type": "array",
+          "minItems": 0,
+          "items": { "$ref": "#/$defs/patchOperation" }
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": ["patch"],
+        "properties": {
+          "patch": {
+            "type": "object",
+            "required": ["operations"],
+            "properties": { "operations": { "type": "array", "maxItems": 0 } }
+          }
+        }
+      },
+      "then": {
+        "anyOf": [
+          { "required": ["variables"], "properties": { "variables": { "type": "array", "minItems": 1 } } },
+          { "required": ["styles"], "properties": { "styles": { "type": "array", "minItems": 1 } } }
+        ]
+      }
+    }
+  ]
+}

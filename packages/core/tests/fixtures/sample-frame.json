@@ -1,0 +1,72 @@
+{
+  "canvas": {
+    "id": "canvas",
+    "name": "Sample frame",
+    "width": 390,
+    "height": 844,
+    "fill": "#F4F4F5"
+  },
+  "nodes": [
+    {
+      "id": "card",
+      "name": "Card",
+      "type": "FRAME",
+      "x": 16,
+      "y": 16,
+      "w": 358,
+      "h": 120,
+      "fill": "#FFFFFF",
+      "cornerRadius": 12,
+      "layout": {
+        "direction": "VERTICAL",
+        "itemSpacing": 8,
+        "padding": { "left": 16, "top": 16, "right": 16, "bottom": 16 }
+      },
+      "children": [
+        {
+          "id": "title",
+          "name": "Title",
+          "type": "TEXT",
+          "w": 200,
+          "h": 24,
+          "text": "Title",
+          "font": { "family": "Inter", "style": "Regular", "size": 16 },
+          "fill": "#111827"
+        },
+        {
+          "id": "body",
+          "name": "Body",
+          "type": "TEXT",
+          "w": 200,
+          "h": 20,
+          "text": "Body",
+          "font": { "family": "Inter", "style": "Regular", "size": 14 },
+          "fill": "#6B7280"
+        }
+      ]
+    },
+    {
+      "id": "hidden",
+      "name": "Hidden",
+      "type": "FRAME",
+      "w": 40,
+      "h": 40,
+      "visible": false,
+      "fill": "#FF00AA",
+      "cornerRadius": 4,
+      "layout": { "direction": "VERTICAL", "itemSpacing": 12 },
+      "children": [
+        {
+          "id": "hidden-label",
+          "name": "Hidden label",
+          "type": "TEXT",
+          "w": 20,
+          "h": 12,
+          "text": "Hidden",
+          "font": { "family": "Inter", "style": "Regular", "size": 12 },
+          "fill": "#00FFAA"
+        }
+      ]
+    }
+  ]
+}

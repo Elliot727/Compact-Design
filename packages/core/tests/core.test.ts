@@ -1,0 +1,3280 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { readFileSync, readdirSync, statSync } from "node:fs";
+import { join } from "node:path";
+import { parseDocument } from "../src/parser";
+import { isPatchDocument, normalizeDocument, normalizePatchDocument } from "../src/normalize";
+import { validateDocument } from "../src/validate";
+import { lintDocument, validationIssues } from "../src/lint";
+import { applyPatch, COMPONENTIZE_DIFF_EXEMPT, COMPONENTIZE_DIFF_EXEMPT_PATCH_KEYS, lint, matchStyle, matchVariable, normalize, normalizePatch, PATCH_SET_APPLIES_TO, PATCH_SET_DEFERRED_KEYS, PATCH_SET_EXCLUDED_NODE_KEYS, PATCH_SET_KEYS, PATCH_SET_SEMANTICS, PatchError, remapDelimitedIds, remapIssueKeyThroughDuplicate, schema, validate, validatePatch, type PatchSetKey } from "../src/index";
+import type { InternalDocument, InternalNode } from "../src/types";
+import { indexDocument } from "../src/references";
+import { anatomy, anatomyMarkdown, ANATOMY_SLOT_NOTE } from "../src/index";
+
+const fixture = (name: string): unknown => JSON.parse(readFileSync(join("..", "..", "examples", name), "utf8"));
+
+test("parses strict JSON and reports malformed input", () => {
+  assert.deepEqual(parseDocument('{"canvas":{"width":10,"height":10},"nodes":[]}'), { canvas: { width: 10, height: 10 }, nodes: [] });
+  assert.throws(() => parseDocument("{broken"), /JSON/);
+});
+
+test("public core API runs without a Figma global", () => {
+  assert.equal("figma" in globalThis, false);
+  const result = validate({ canvas: { width: 100, height: 100 }, nodes: [] });
+  assert.equal(result.valid, true);
+  assert.ok(result.document);
+  assert.equal(schema.$schema, "https://json-schema.org/draft/2020-12/schema");
+});
+
+test("public validation returns structured schema and semantic issues", () => {
+  const schemaResult = validate({ canvas: { width: "wide", height: 100 }, nodes: [] });
+  assert.equal(schemaResult.valid, false);
+  assert.ok(schemaResult.issues.every((issue) => issue.path.startsWith("$")));
+  const semanticResult = validate({ canvas: { width: 100, height: 100 }, nodes: [{ id: "same", type: "FRAME", w: 10, h: 10 }, { id: "same", type: "FRAME", w: 10, h: 10 }] });
+  assert.equal(semanticResult.valid, false);
+  assert.ok(semanticResult.issues.some((issue) => issue.message.includes("duplicate ID")));
+});
+
+test("reference indexing and component resolution are core concerns", () => {
+  const valid = normalize({ canvas: { width: 100, height: 100 }, nodes: [{ id: "button", type: "COMPONENT", w: 20, h: 20 }, { id: "button-copy", type: "INSTANCE", componentId: "button", w: 20, h: 20 }] });
+  assert.equal(indexDocument(valid).components.get("button")?.type, "COMPONENT");
+  const invalid = validate({ canvas: { width: 100, height: 100 }, nodes: [{ id: "button-copy", type: "INSTANCE", componentId: "missing", w: 20, h: 20 }] });
+  assert.equal(invalid.valid, false);
+  assert.ok(invalid.issues.some((issue) => issue.message.includes("not defined")));
+});
+
+test("normalizes canonical text, paints, gradients, and coordinates", () => {
+  const document = normalizeDocument({ canvas: { id: "c", width: 400, height: 300, fill: "#112233" }, nodes: [{ id: "f", type: "FRAME", x: 20, y: 30, w: 200, h: 100, fill: { gradient: "LINEAR", angle: 45, stops: [{ at: 0, color: "#000000" }, { at: 1, color: "#FFFFFF" }] }, children: [{ id: "t", type: "TEXT", x: 5, y: 7, w: 100, h: 20, text: "Hello", font: { family: "Georgia", style: "Bold", size: 18 }, align: "CENTER" }] }] });
+  const frame = document.nodes[0].children[0]; const text = frame.children[0];
+  assert.equal(frame.properties.position.x, 20); assert.equal(text.properties.position.x, 25);
+  assert.equal(frame.properties.styles.fills[0].type, "GRADIENT_LINEAR");
+  assert.equal(text.properties.font?.size, 18); assert.equal(text.properties.alignment, "CENTER");
+});
+
+test("normalizes compact scrolling names to canonical overflow directions", () => {
+  const cases = [
+    ["NONE", "NONE"],
+    ["HORIZONTAL", "HORIZONTAL"],
+    ["VERTICAL", "VERTICAL"],
+    ["BOTH", "BOTH"],
+    ["HORIZONTAL_SCROLLING", "HORIZONTAL"],
+    ["VERTICAL_SCROLLING", "VERTICAL"],
+    ["HORIZONTAL_AND_VERTICAL_SCROLLING", "BOTH"]
+  ] as const;
+  for (const [authored, canonical] of cases) {
+    const document = normalize({ canvas: { width: 100, height: 100 }, nodes: [{ type: "FRAME", w: 50, h: 50, overflowDirection: authored }] });
+    assert.equal(document.nodes[0].children[0].properties.overflowDirection, canonical);
+  }
+});
+
+test("validate accepts authored and short overflowDirection names", () => {
+  for (const authored of ["VERTICAL_SCROLLING", "VERTICAL"] as const) {
+    const result = validate({ canvas: { width: 100, height: 100 }, nodes: [{ type: "FRAME", w: 50, h: 50, overflowDirection: authored }] });
+    assert.equal(result.valid, true, result.issues.map((issue) => `${issue.path} ${issue.message}`).join("; "));
+    assert.equal(result.document?.nodes[0].children[0].properties.overflowDirection, "VERTICAL");
+  }
+  const rejected = validate({ canvas: { width: 100, height: 100 }, nodes: [{ type: "FRAME", w: 50, h: 50, overflowDirection: "DIAGONAL" }] });
+  assert.equal(rejected.valid, false);
+  assert.ok(rejected.issues.some((issue) => issue.path.includes("overflowDirection")));
+});
+
+test("rejects removed text aliases", () => {
+  assert.throws(() => normalizeDocument({ canvas: { width: 100, height: 100 }, nodes: [{ type: "TEXT", w: 20, h: 20, text: "x", alignment: "CENTER" }] }), /use align/);
+  assert.throws(() => normalizeDocument({ canvas: { width: 100, height: 100 }, nodes: [{ type: "TEXT", w: 20, h: 20, text: "x", fontSize: 20 }] }), /font\.size/);
+});
+
+test("parses resources at the untrusted document boundary", () => {
+  const document = normalizeDocument({
+    canvas: { width: 100, height: 100 },
+    styles: [{ id: "ink", name: "Ink", type: "PAINT", paints: ["#112233"] }],
+    variables: [{ name: "Theme", modes: ["Light", "Dark"], items: [{ id: "surface", name: "Surface", type: "COLOR", values: { Light: { r: 255, g: 255, b: 255, a: 1 }, Dark: { r: 0, g: 0, b: 0, a: 1 } } }] }]
+  });
+  assert.equal(document.styles[0].paints?.[0].type, "SOLID");
+  assert.deepEqual(document.variables[0].modes, ["Light", "Dark"]);
+  assert.throws(() => normalizeDocument({ canvas: { width: 100, height: 100 }, styles: [{ name: "Broken", type: "PAINT", paints: "red" }] }), /styles\[0\]\.paints/);
+  assert.throws(() => normalizeDocument({ canvas: { width: 100, height: 100 }, variables: [{ name: "Broken", items: "nope" }] }), /variables\[0\]\.items/);
+});
+
+test("validates geometry, auto layout, variables, and prototype destinations", () => {
+  assert.throws(() => normalizeDocument({ canvas: { width: 300, height: 300 }, variables: [{ name: "Theme", items: [{ name: "flag", type: "BOOLEAN", value: "wrong" }] }] }), /must match variable type BOOLEAN/);
+  const document = normalizeDocument({ canvas: { width: 300, height: 300 }, nodes: [{ id: "bad", type: "FRAME", w: -1, h: 20, layout: { direction: "SIDEWAYS" }, prototype: [{ trigger: { type: "ON_CLICK" }, actions: [{ type: "NAVIGATE", destination: "missing" }] }] }] });
+  const errors = validateDocument(document);
+  assert.ok(errors.some((value) => value.includes("positive finite")));
+  assert.ok(errors.some((value) => value.includes("HORIZONTAL")));
+  assert.ok(errors.some((value) => /destination 'missing' was not found/i.test(value)), errors.join("\n"));
+  assert.ok(lintDocument(document).some((issue) => issue.code === "BROKEN_PROTOTYPE_DESTINATION"));
+});
+
+test("accepts Figma open vector paths with a NONE winding rule", () => {
+  const result = validate({
+    canvas: { width: 100, height: 100 },
+    nodes: [{ type: "VECTOR", w: 80, h: 20, vectorPaths: [{ windingRule: "NONE", data: "M 0 0 L 80 20" }] }]
+  });
+  assert.equal(result.valid, true);
+});
+
+test("normalizes patch set, remove, and append operations", () => {
+  const patch = normalizePatchDocument(fixture("update-patch-sample.json"));
+  assert.deepEqual(patch.patch.operations.map((operation) => operation.op), ["SET", "SET", "APPEND"]);
+  assert.equal(patch.patch.operations[0].normalized?.text, "The same design.\nA different mood.");
+  assert.equal(patch.patch.operations[2].node?.id, "theme-note");
+});
+
+test("abstract patching updates canonical documents without mutation", () => {
+  const document = normalize({ canvas: { width: 300, height: 200 }, nodes: [{ id: "parent", type: "FRAME", w: 200, h: 100, children: [{ id: "title", type: "TEXT", w: 100, h: 20, text: "Before" }] }] });
+  const patch = normalizePatch({ patch: { operations: [{ op: "set", id: "title", set: { text: "After", fill: "#FF0000" } }, { op: "append", parent: "parent", node: { id: "badge", type: "RECTANGLE", w: 20, h: 20, fill: "#00FF00" } }] } });
+  const result = applyPatch(document, patch);
+  assert.equal(document.nodes[0].children[0].children[0].properties.text, "Before");
+  assert.equal(result.document.nodes[0].children[0].children[0].properties.text, "After");
+  assert.equal(result.document.nodes[0].children[0].children[1].id, "badge");
+  assert.deepEqual(result.affectedIds, ["title", "badge"]);
+});
+
+test("public lint runs on canonical documents independently", () => {
+  const document = normalize({ canvas: { width: 100, height: 100 }, nodes: [{ id: "tiny-button", name: "Button", type: "FRAME", w: 20, h: 20 }] });
+  assert.ok(lint(document).some((issue) => issue.code === "SMALL_TOUCH_TARGET"));
+});
+
+test("lint detects requested design-quality problems", () => {
+  const children = Array.from({ length: 3 }, (_, index) => ({ id: `b${index}`, name: "Button", type: "FRAME", x: index * 40, y: 0, w: 30, h: 30, fill: "#777777", prototype: [{ trigger: { type: "ON_CLICK" }, actions: [{ type: "BACK" }] }], children: [{ id: `t${index}`, type: "TEXT", x: 0, y: 0, w: 20, h: 8, text: "Overflowing text", font: { size: 12 }, fill: "#787878", textAutoResize: "NONE" }] }));
+  const issues = lintDocument(normalizeDocument({ canvas: { width: 300, height: 200, fill: "#777777" }, nodes: [{ id: "row", type: "FRAME", w: 200, h: 50, children }] }));
+  for (const code of ["LOW_CONTRAST", "SMALL_TOUCH_TARGET", "MISSING_AUTO_LAYOUT", "REPEATED_DETACHED_ELEMENTS", "MISSING_COMPONENT_USAGE", "TEXT_OVERFLOW", "DUPLICATE_UNBOUND_COLOUR"]) assert.ok(issues.some((issue) => issue.code === code), `missing ${code}`);
+});
+
+test("structured repair issues retain paths and suggestions", () => {
+  const issues = validationIssues(["nodes[0].size: w and h must be positive"]);
+  assert.equal(issues[0].path, "nodes[0].size"); assert.equal(issues[0].severity, "ERROR"); assert.ok(issues[0].suggestion);
+});
+
+test("all maintained examples parse and full documents validate", () => {
+  for (const name of readdirSync("../../examples").filter((value) => value.endsWith(".json"))) {
+    const source = fixture(name);
+    if (isPatchDocument(source)) {
+      normalizePatchDocument(source);
+      const publicResult = validate(source);
+      assert.equal(publicResult.valid, true, `${name}: ${publicResult.issues.map((issue) => `${issue.path} ${issue.message}`).join("; ")}`);
+    } else {
+      assert.deepEqual(validateDocument(normalizeDocument(source)), [], name);
+      const publicResult = validate(source);
+      assert.equal(publicResult.valid, true, `${name}: ${publicResult.issues.map((issue) => `${issue.path} ${issue.message}`).join("; ")}`);
+    }
+  }
+});
+
+test("formal schema exposes the current contract", () => {
+  const specSchema = JSON.parse(readFileSync("../../spec/compact-design.schema.json", "utf8"));
+  assert.deepEqual(schema, specSchema);
+  assert.equal(specSchema.$schema, "https://json-schema.org/draft/2020-12/schema");
+  for (const key of ["node", "paint", "prototype", "variable", "patchRoot"]) assert.ok(specSchema.$defs[key], key);
+  assert.equal(specSchema.$defs.node.properties.alignment, undefined);
+  assert.equal(specSchema.$defs.node.properties.fontSize, undefined);
+});
+
+test("source code contains no explicit any annotations", () => {
+  const files: string[] = [];
+  const walk = (directory: string): void => {
+    for (const name of readdirSync(directory)) {
+      const path = join(directory, name);
+      if (statSync(path).isDirectory()) walk(path);
+      else if (path.endsWith(".ts")) files.push(path);
+    }
+  };
+  walk("src");
+  const explicitAny = /:\s*any\b|\bas\s+any\b|<\s*any\s*>|\bany\s*\[\s*\]|Record<[^>]*,\s*any\s*>/g;
+  const violations = files.flatMap((path) => [...readFileSync(path, "utf8").matchAll(explicitAny)].map((match) => `${path}:${match.index}`));
+  assert.deepEqual(violations, []);
+});
+
+test("canvas variableModes and bindings pass through to the root frame", () => {
+  const document = normalizeDocument({
+    canvas: {
+      id: "screen",
+      width: 390,
+      height: 844,
+      fill: "#F8F5EE",
+      variableModes: { Theme: "Dark" },
+      bindings: { fill: "surface" }
+    },
+    nodes: [],
+    variables: [{
+      name: "Theme",
+      modes: ["Light", "Dark"],
+      items: [{ id: "surface", name: "colour/surface", type: "COLOR", values: { Light: { r: 248, g: 245, b: 238, a: 1 }, Dark: { r: 26, g: 27, b: 24, a: 1 } } }]
+    }]
+  });
+  assert.deepEqual(document.nodes[0].properties.variableModes, { Theme: "Dark" });
+  assert.deepEqual(document.nodes[0].properties.bindings, { fill: "surface" });
+});
+
+test("rejects unknown bindings and variableModes against document.variables", () => {
+  const missingBinding = validate({
+    canvas: { width: 100, height: 100 },
+    nodes: [{ id: "card", type: "FRAME", w: 50, h: 50, bindings: { fill: "missing-token" } }],
+    variables: [{ name: "Theme", items: [{ id: "surface", name: "colour/surface", type: "COLOR", value: { r: 1, g: 1, b: 1, a: 1 } }] }]
+  });
+  assert.equal(missingBinding.valid, false);
+  assert.ok(missingBinding.issues.some((issue) => issue.path.includes("bindings.fill") && /missing-token/.test(issue.message)));
+
+  const missingMode = validate({
+    canvas: { width: 100, height: 100 },
+    nodes: [{ id: "screen", type: "FRAME", w: 100, h: 100, variableModes: { Theme: "Midnight" } }],
+    variables: [{
+      name: "Theme",
+      modes: ["Light", "Dark"],
+      items: [{ id: "surface", name: "colour/surface", type: "COLOR", values: { Light: { r: 248, g: 245, b: 238, a: 1 }, Dark: { r: 26, g: 27, b: 24, a: 1 } } }]
+    }]
+  });
+  assert.equal(missingMode.valid, false);
+  assert.ok(missingMode.issues.some((issue) => issue.path.includes("variableModes.Theme") && /Midnight/.test(issue.message)));
+
+  const missingCollection = validate({
+    canvas: { width: 100, height: 100 },
+    nodes: [{ id: "card", type: "FRAME", w: 50, h: 50, variableModes: { Brand: "Default" } }],
+    variables: [{ name: "Theme", items: [{ id: "surface", name: "colour/surface", type: "COLOR", value: { r: 1, g: 1, b: 1, a: 1 } }] }]
+  });
+  assert.equal(missingCollection.valid, false);
+  assert.ok(missingCollection.issues.some((issue) => /Brand/.test(issue.message)));
+});
+
+test("accepts Theme Dark and bindings.fill surface when variables are declared", () => {
+  const result = validate({
+    canvas: { id: "screen", width: 390, height: 844, fill: "#F8F5EE" },
+    nodes: [
+      { id: "shell", type: "FRAME", w: 390, h: 844, variableModes: { Theme: "Dark" }, bindings: { fill: "surface" }, children: [
+        { id: "card", type: "FRAME", w: 100, h: 40, bindings: { fill: "colour/surface" } }
+      ] }
+    ],
+    variables: [{
+      name: "Theme",
+      modes: ["Light", "Dark"],
+      items: [{ id: "surface", name: "colour/surface", type: "COLOR", values: { Light: { r: 248, g: 245, b: 238, a: 1 }, Dark: { r: 26, g: 27, b: 24, a: 1 } } }]
+    }]
+  });
+  assert.equal(result.valid, true, result.issues.map((issue) => `${issue.path}: ${issue.message}`).join("\n"));
+});
+
+test("rejects unknown styleRefs against document.styles", () => {
+  const missingStyle = validate({
+    canvas: { width: 100, height: 100 },
+    nodes: [{ id: "card", type: "FRAME", w: 50, h: 50, styleRefs: { fill: "missing-ink" } }],
+    styles: [{ id: "ink", name: "Ink", type: "PAINT", paints: ["#112233"] }]
+  });
+  assert.equal(missingStyle.valid, false);
+  assert.ok(missingStyle.issues.some((issue) => issue.path.includes("styleRefs.fill") && /missing-ink/.test(issue.message)));
+
+  const emptyRef = validate({
+    canvas: { width: 100, height: 100 },
+    nodes: [{ id: "card", type: "FRAME", w: 50, h: 50, styleRefs: { stroke: "" } }],
+    styles: [{ id: "ink", name: "Ink", type: "PAINT", paints: ["#112233"] }]
+  });
+  assert.equal(emptyRef.valid, false);
+  assert.ok(emptyRef.issues.some((issue) => issue.path.includes("styleRefs.stroke") && /non-empty/.test(issue.message)));
+
+  const wrongType = validate({
+    canvas: { width: 100, height: 100 },
+    nodes: [{ id: "label", type: "TEXT", w: 40, h: 16, text: "Hi", styleRefs: { fill: "Body", text: "ink" } }],
+    styles: [
+      { id: "ink", name: "Ink", type: "PAINT", paints: ["#112233"] },
+      { id: "body", name: "Body", type: "TEXT", font: { family: "Inter", style: "Regular", size: 14 } }
+    ]
+  });
+  assert.equal(wrongType.valid, false);
+  assert.ok(wrongType.issues.some((issue) => issue.path.includes("styleRefs.fill") && /PAINT/.test(issue.message)));
+  assert.ok(wrongType.issues.some((issue) => issue.path.includes("styleRefs.text") && /TEXT/.test(issue.message)));
+});
+
+test("accepts styleRefs by id and name when styles are declared", () => {
+  const result = validate({
+    canvas: { width: 100, height: 100 },
+    nodes: [
+      { id: "card", type: "FRAME", w: 50, h: 50, styleRefs: { fill: "ink", stroke: "Ink" }, children: [
+        { id: "label", type: "TEXT", w: 40, h: 16, text: "Hi", styleRefs: { text: "Body" } }
+      ] }
+    ],
+    styles: [
+      { id: "ink", name: "Ink", type: "PAINT", paints: ["#112233"] },
+      { id: "body", name: "Body", type: "TEXT", font: { family: "Inter", style: "Regular", size: 14 } }
+    ]
+  });
+  assert.equal(result.valid, true, result.issues.map((issue) => `${issue.path}: ${issue.message}`).join("\n"));
+});
+
+test("BOOLEAN_OPERATION requires a valid operation enum", () => {
+  const children = [
+    { id: "a", type: "RECTANGLE", w: 20, h: 20 },
+    { id: "b", type: "RECTANGLE", w: 20, h: 20 }
+  ];
+  const missing = validate({
+    canvas: { width: 100, height: 100 },
+    nodes: [{ id: "bool", type: "BOOLEAN_OPERATION", w: 40, h: 40, children }]
+  });
+  assert.equal(missing.valid, false);
+  assert.ok(missing.issues.some((issue) => issue.path.includes("operation")));
+
+  const badDocument = normalizeDocument({
+    canvas: { width: 100, height: 100 },
+    nodes: [{ id: "bool", type: "BOOLEAN_OPERATION", w: 40, h: 40, operation: "MERGE", children }]
+  });
+  const badErrors = validateDocument(badDocument);
+  assert.ok(badErrors.some((value) => value.includes("operation") && /UNION|SUBTRACT|INTERSECT|EXCLUDE/.test(value)));
+
+  const valid = validate({
+    canvas: { width: 100, height: 100 },
+    nodes: [{ id: "bool", type: "BOOLEAN_OPERATION", w: 40, h: 40, operation: "UNION", children }]
+  });
+  assert.equal(valid.valid, true, valid.issues.map((issue) => `${issue.path}: ${issue.message}`).join("\n"));
+});
+
+test("schema accepts NOISE, TEXTURE, and GLASS effects with type-specific fields", () => {
+  const result = validate({
+    canvas: { width: 100, height: 100 },
+    nodes: [{
+      id: "fx",
+      type: "FRAME",
+      w: 80,
+      h: 80,
+      effects: [
+        { type: "DROP_SHADOW", color: "#00000055", offset: { x: 0, y: 4 }, blur: 8, spread: 0, showShadowBehindNode: true },
+        { type: "LAYER_BLUR", blur: 12, blurType: "PROGRESSIVE", startRadius: 0, startOffset: { x: 0.5, y: 0 }, endOffset: { x: 0.5, y: 1 } },
+        { type: "NOISE", noiseType: "DUOTONE", color: "#112233", secondaryColor: "#AABBCC", noiseSize: 2, density: 0.4, blendMode: "OVERLAY" },
+        { type: "TEXTURE", noiseSize: 3, radius: 1.5, clipToShape: true },
+        { type: "GLASS", lightIntensity: 0.7, lightAngle: -30, refraction: 0.4, depth: 2, dispersion: 0.2, radius: 8 }
+      ]
+    }]
+  });
+  assert.equal(result.valid, true, result.issues.map((issue) => `${issue.path}: ${issue.message}`).join("\n"));
+  const effects = result.document!.nodes[0].children[0].properties.styles.effects;
+  assert.equal(effects.find((effect) => effect.type === "NOISE")?.noiseType, "DUOTONE");
+  assert.equal(effects.find((effect) => effect.type === "TEXTURE")?.clipToShape, true);
+  assert.equal(effects.find((effect) => effect.type === "GLASS")?.depth, 2);
+  assert.equal(effects.find((effect) => effect.type === "DROP_SHADOW")?.showShadowBehindNode, true);
+  assert.equal(effects.find((effect) => effect.type === "LAYER_BLUR")?.blurType, "PROGRESSIVE");
+});
+
+test("schema accepts SHADER effects with id, visible, and loose properties", () => {
+  const result = validate({
+    canvas: { width: 100, height: 100 },
+    nodes: [{
+      id: "fx",
+      type: "FRAME",
+      w: 40,
+      h: 40,
+      effects: [{
+        type: "SHADER",
+        id: "shader-1",
+        visible: true,
+        properties: {
+          "def:amount": 0.5,
+          "def:enabled": true,
+          "def:mode": "soft",
+          "def:tint": { r: 1, g: 0.5, b: 0, a: 1 },
+          "def:center": { x: 0.5, y: 0.5 },
+          "def:ramp": { stops: [{ position: 0, color: { r: 0, g: 0, b: 0 } }, { position: 1, color: { r: 1, g: 1, b: 1 } }] },
+          "def:bound": { type: "VARIABLE_ALIAS", id: "VariableID:1:2" }
+        }
+      }]
+    }]
+  });
+  assert.equal(result.valid, true, result.issues.map((issue) => `${issue.path}: ${issue.message}`).join("\n"));
+  const [shader] = result.document!.nodes[0].children[0].properties.styles.effects;
+  assert.equal(shader.type, "SHADER");
+  assert.equal(shader.id, "shader-1");
+  assert.equal(shader.visible, true);
+  assert.deepEqual(shader.properties?.["def:center"], { x: 0.5, y: 0.5 });
+  assert.equal(shader.properties?.["def:amount"], 0.5);
+  assert.equal("color" in shader || "offset" in shader || "radius" in shader, false);
+});
+
+test("schema requires an id on SHADER effects", () => {
+  const result = validate({
+    canvas: { width: 100, height: 100 },
+    nodes: [{ id: "fx", type: "FRAME", w: 40, h: 40, effects: [{ type: "SHADER", visible: true }] }]
+  });
+  assert.equal(result.valid, false);
+  assert.ok(result.issues.some((issue) => /effects\/0\/id$/.test(issue.path) && issue.code === "SCHEMA_REQUIRED"), JSON.stringify(result.issues));
+});
+
+function childIds(document: ReturnType<typeof normalize>, parentId: string): string[] {
+  const visit = (nodes: typeof document.nodes): string[] | null => {
+    for (const node of nodes) {
+      if (node.id === parentId) return node.children.map((child) => child.id);
+      const nested = visit(node.children);
+      if (nested) return nested;
+    }
+    return null;
+  };
+  return visit(document.nodes) || [];
+}
+
+function findNode(document: ReturnType<typeof normalize>, id: string) {
+  const visit = (nodes: typeof document.nodes): (typeof document.nodes)[number] | null => {
+    for (const node of nodes) {
+      if (node.id === id) return node;
+      const nested = visit(node.children);
+      if (nested) return nested;
+    }
+    return null;
+  };
+  return visit(document.nodes);
+}
+
+test("normalizes and validates insert and move operations", () => {
+  const patch = normalizePatch({
+    patch: {
+      operations: [
+        { op: "insert", parent: "list", index: 1, node: { id: "mid", type: "FRAME", w: 10, h: 10 } },
+        { op: "move", id: "mid", parent: "list", index: 0 }
+      ]
+    }
+  });
+  assert.deepEqual(patch.patch.operations.map((operation) => operation.op), ["INSERT", "MOVE"]);
+  assert.equal(patch.patch.operations[0].index, 1);
+  assert.equal(patch.patch.operations[0].node?.id, "mid");
+  assert.equal(patch.patch.operations[1].id, "mid");
+  assert.equal(validate({
+    patch: {
+      operations: [
+        { op: "insert", parent: "list", index: 0, node: { type: "FRAME", w: 10, h: 10 } },
+        { op: "move", id: "a", parent: "list", index: 2 }
+      ]
+    }
+  }).valid, true);
+});
+
+test("rejects negative or non-integer patch index in schema and normalize", () => {
+  for (const index of [-1, 1.5, "0", null]) {
+    const result = validate({
+      patch: { operations: [{ op: "insert", parent: "list", index, node: { type: "FRAME", w: 10, h: 10 } }] }
+    });
+    assert.equal(result.valid, false, `index=${String(index)}`);
+  }
+  assert.throws(
+    () => normalizePatch({ patch: { operations: [{ op: "move", id: "a", parent: "list", index: -1 }] } }),
+    /non-negative integer/
+  );
+  assert.throws(
+    () => normalizePatch({ patch: { operations: [{ op: "insert", parent: "list", index: 1.2, node: { type: "FRAME", w: 10, h: 10 } }] } }),
+    /non-negative integer/
+  );
+});
+
+test("insert places children at middle, zero, and clamped end", () => {
+  const document = normalize({
+    canvas: { width: 300, height: 200 },
+    nodes: [{ id: "list", type: "FRAME", w: 200, h: 100, children: [
+      { id: "a", type: "RECTANGLE", w: 10, h: 10 },
+      { id: "b", type: "RECTANGLE", w: 10, h: 10 },
+      { id: "c", type: "RECTANGLE", w: 10, h: 10 }
+    ] }]
+  });
+  const middle = applyPatch(document, normalizePatch({
+    patch: { operations: [{ op: "insert", parent: "list", index: 1, node: { id: "mid", type: "RECTANGLE", w: 10, h: 10 } }] }
+  }));
+  assert.deepEqual(childIds(middle.document, "list"), ["a", "mid", "b", "c"]);
+
+  const atZero = applyPatch(document, normalizePatch({
+    patch: { operations: [{ op: "insert", parent: "list", index: 0, node: { id: "first", type: "RECTANGLE", w: 10, h: 10 } }] }
+  }));
+  assert.deepEqual(childIds(atZero.document, "list"), ["first", "a", "b", "c"]);
+
+  const clamped = applyPatch(document, normalizePatch({
+    patch: { operations: [{ op: "insert", parent: "list", index: 99, node: { id: "tail", type: "RECTANGLE", w: 10, h: 10 } }] }
+  }));
+  assert.deepEqual(childIds(clamped.document, "list"), ["a", "b", "c", "tail"]);
+});
+
+test("append matches insert at children.length", () => {
+  const source = {
+    canvas: { width: 300, height: 200 },
+    nodes: [{ id: "list", type: "FRAME", w: 200, h: 100, children: [
+      { id: "a", type: "RECTANGLE", w: 10, h: 10 },
+      { id: "b", type: "RECTANGLE", w: 10, h: 10 }
+    ] }]
+  };
+  const document = normalize(source);
+  const viaAppend = applyPatch(document, normalizePatch({
+    patch: { operations: [{ op: "append", parent: "list", node: { id: "z", type: "RECTANGLE", w: 10, h: 10 } }] }
+  }));
+  const viaInsert = applyPatch(document, normalizePatch({
+    patch: { operations: [{ op: "insert", parent: "list", index: 2, node: { id: "z", type: "RECTANGLE", w: 10, h: 10 } }] }
+  }));
+  assert.deepEqual(childIds(viaAppend.document, "list"), childIds(viaInsert.document, "list"));
+  assert.deepEqual(childIds(viaAppend.document, "list"), ["a", "b", "z"]);
+
+  // Same parent validation as insert: missing parent, non-container, INSTANCE.
+  for (const op of ["append", "insert"] as const) {
+    const missingParent = { op, parent: "nope", ...(op === "insert" ? { index: 0 } : {}), node: { id: "x", type: "RECTANGLE", w: 1, h: 1 } };
+    assert.throws(() => applyPatch(document, normalizePatch({ patch: { operations: [missingParent] } })), /was not found/);
+    const intoLeaf = { op, parent: "a", ...(op === "insert" ? { index: 0 } : {}), node: { id: "x", type: "RECTANGLE", w: 1, h: 1 } };
+    assert.throws(() => applyPatch(document, normalizePatch({ patch: { operations: [intoLeaf] } })), /cannot contain children/);
+  }
+  const withInstance = normalize({
+    canvas: { width: 100, height: 100 },
+    nodes: [
+      { id: "button", type: "COMPONENT", w: 20, h: 20 },
+      { id: "copy", type: "INSTANCE", componentId: "button", w: 20, h: 20 }
+    ]
+  });
+  for (const op of ["append", "insert"] as const) {
+    const intoInstance = { op, parent: "copy", ...(op === "insert" ? { index: 0 } : {}), node: { id: "x", type: "RECTANGLE", w: 1, h: 1 } };
+    assert.throws(() => applyPatch(withInstance, normalizePatch({ patch: { operations: [intoInstance] } })), /INSTANCE/);
+  }
+});
+
+test("move reorders within parent using after-removal index", () => {
+  const document = normalize({
+    canvas: { width: 300, height: 200 },
+    nodes: [{ id: "list", type: "FRAME", w: 200, h: 100, children: [
+      { id: "a", type: "RECTANGLE", w: 10, h: 10 },
+      { id: "b", type: "RECTANGLE", w: 10, h: 10 },
+      { id: "c", type: "RECTANGLE", w: 10, h: 10 },
+      { id: "d", type: "RECTANGLE", w: 10, h: 10 }
+    ] }]
+  });
+  // Move b to final index 2 after removal → [a, c, b, d]
+  const reordered = applyPatch(document, normalizePatch({
+    patch: { operations: [{ op: "move", id: "b", parent: "list", index: 2 }] }
+  }));
+  assert.deepEqual(childIds(reordered.document, "list"), ["a", "c", "b", "d"]);
+
+  const clamped = applyPatch(document, normalizePatch({
+    patch: { operations: [{ op: "move", id: "a", parent: "list", index: 99 }] }
+  }));
+  assert.deepEqual(childIds(clamped.document, "list"), ["b", "c", "d", "a"]);
+});
+
+test("move reparents, clamps, and rejects cycles, missing targets, roots, and instances", () => {
+  const document = normalize({
+    canvas: { id: "canvas", width: 300, height: 200 },
+    nodes: [{
+      id: "outer", type: "FRAME", w: 200, h: 100, children: [
+        { id: "inner", type: "FRAME", w: 80, h: 80, children: [
+          { id: "leaf", type: "RECTANGLE", w: 10, h: 10 }
+        ] },
+        { id: "sibling", type: "FRAME", w: 40, h: 40, children: [] }
+      ]
+    }]
+  });
+
+  const reparented = applyPatch(document, normalizePatch({
+    patch: { operations: [{ op: "move", id: "leaf", parent: "sibling", index: 0 }] }
+  }));
+  assert.deepEqual(childIds(reparented.document, "inner"), []);
+  assert.deepEqual(childIds(reparented.document, "sibling"), ["leaf"]);
+
+  assert.throws(
+    () => applyPatch(document, normalizePatch({ patch: { operations: [{ op: "move", id: "outer", parent: "inner", index: 0 }] } })),
+    /itself or its descendants/
+  );
+  assert.throws(
+    () => applyPatch(document, normalizePatch({ patch: { operations: [{ op: "move", id: "missing", parent: "outer", index: 0 }] } })),
+    /was not found/
+  );
+  assert.throws(
+    () => applyPatch(document, normalizePatch({ patch: { operations: [{ op: "move", id: "leaf", parent: "missing", index: 0 }] } })),
+    /was not found/
+  );
+  assert.throws(
+    () => applyPatch(document, normalizePatch({ patch: { operations: [{ op: "move", id: "canvas", parent: "outer", index: 0 }] } })),
+    /document root/
+  );
+  assert.throws(
+    () => applyPatch(document, normalizePatch({ patch: { operations: [{ op: "insert", parent: "leaf", index: 0, node: { id: "x", type: "RECTANGLE", w: 1, h: 1 } }] } })),
+    /cannot contain children/
+  );
+
+  const withInstance = normalize({
+    canvas: { width: 100, height: 100 },
+    nodes: [
+      { id: "button", type: "COMPONENT", w: 20, h: 20 },
+      { id: "copy", type: "INSTANCE", componentId: "button", w: 20, h: 20, children: [{ id: "slot", type: "FRAME", w: 10, h: 10 }] }
+    ]
+  });
+  assert.throws(
+    () => applyPatch(withInstance, normalizePatch({ patch: { operations: [{ op: "insert", parent: "copy", index: 0, node: { id: "x", type: "RECTANGLE", w: 1, h: 1 } }] } })),
+    /INSTANCE/
+  );
+  assert.throws(
+    () => applyPatch(withInstance, normalizePatch({ patch: { operations: [{ op: "move", id: "button", parent: "slot", index: 0 }] } })),
+    /INSTANCE/
+  );
+  assert.throws(
+    () => applyPatch(withInstance, normalizePatch({ patch: { operations: [{ op: "move", id: "slot", parent: "button", index: 0 }] } })),
+    /inside an INSTANCE and cannot be moved/
+  );
+});
+
+test("end-to-end insert+move+set patch validates the resulting multi-node document", () => {
+  const source = {
+    canvas: { id: "screen", width: 390, height: 844, fill: "#F6F0E4" },
+    nodes: [{
+      id: "card",
+      type: "FRAME",
+      w: 320,
+      h: 200,
+      fill: "#FFFFFF",
+      children: [
+        { id: "title", type: "TEXT", w: 280, h: 24, text: "Before", font: { family: "Inter", style: "Bold", size: 18 }, fill: "#111111" },
+        { id: "body", type: "TEXT", w: 280, h: 40, text: "Details", font: { family: "Inter", style: "Regular", size: 14 }, fill: "#333333" },
+        { id: "footer", type: "FRAME", w: 280, h: 40, children: [
+          { id: "chip-a", type: "RECTANGLE", w: 40, h: 20, fill: "#6C5CFF" },
+          { id: "chip-b", type: "RECTANGLE", w: 40, h: 20, fill: "#B69B62" }
+        ] }
+      ]
+    }]
+  };
+  const document = normalize(source);
+  assert.deepEqual(validateDocument(document), []);
+
+  const patch = normalizePatch({
+    patch: {
+      operations: [
+        { op: "insert", parent: "footer", index: 1, node: { id: "chip-mid", type: "RECTANGLE", w: 40, h: 20, fill: "#00AA88" } },
+        { op: "move", id: "body", parent: "card", index: 0 },
+        { op: "set", id: "title", set: { text: "After patch", fill: "#001122" } },
+        { op: "append", parent: "card", node: { id: "note", type: "TEXT", w: 280, h: 16, text: "Note", font: { size: 12 }, fill: "#666666" } }
+      ]
+    }
+  });
+  const result = applyPatch(document, patch);
+  assert.deepEqual(validateDocument(result.document), []);
+  assert.deepEqual(childIds(result.document, "card"), ["body", "title", "footer", "note"]);
+  assert.deepEqual(childIds(result.document, "footer"), ["chip-a", "chip-mid", "chip-b"]);
+  assert.equal(findNode(result.document, "title")?.properties.text, "After patch");
+  assert.deepEqual(result.affectedIds, ["chip-mid", "body", "title", "note"]);
+  // Original document is untouched (round-trip safety).
+  assert.deepEqual(childIds(document, "card"), ["title", "body", "footer"]);
+  assert.equal(findNode(document, "title")?.properties.text, "Before");
+});
+
+
+// --- Typed, merging patch set (PR1) -----------------------------------------
+
+const patchOf = (...operations: unknown[]) => ({ patch: { operations } });
+const setOp = (id: string, set: Record<string, unknown>) => ({ op: "set", id, set });
+const nodeById = (document: InternalDocument, id: string): InternalNode => {
+  const found = findNode(document, id);
+  assert.ok(found, `node ${id}`);
+  return found;
+};
+const applyRaw = (document: InternalDocument, ...operations: unknown[]) => {
+  const result = validatePatch(document, patchOf(...operations));
+  assert.equal(result.valid, true, result.issues.map((issue) => `${issue.path}: ${issue.message}`).join("; "));
+  return result.document!;
+};
+const rejects = (document: InternalDocument, pattern: RegExp, ...operations: unknown[]) => {
+  const result = validatePatch(document, patchOf(...operations));
+  assert.equal(result.valid, false, `expected rejection matching ${pattern}`);
+  assert.match(result.issues.map((issue) => `${issue.path}: ${issue.message}`).join("\n"), pattern);
+  return result.issues;
+};
+
+const baseDocument = () => normalize({
+  canvas: { id: "screen", width: 800, height: 600, fill: "#FFFFFF" },
+  nodes: [
+    { id: "outer", type: "FRAME", x: 100, y: 40, w: 500, h: 400, children: [
+      { id: "inner", type: "FRAME", x: 50, y: 30, w: 300, h: 200, children: [
+        { id: "leaf", type: "RECTANGLE", x: 10, y: 5, w: 20, h: 20, fill: "#FF0000" }
+      ] },
+      { id: "sibling", type: "FRAME", x: 200, y: 250, w: 100, h: 100, children: [] }
+    ] },
+    { id: "stack", type: "FRAME", x: 0, y: 460, w: 400, h: 100, layout: { direction: "HORIZONTAL", itemSpacing: 8, padding: { left: 16, top: 12, right: 16, bottom: 12 }, primaryAxisAlignItems: "CENTER" }, children: [
+      { id: "chip", type: "RECTANGLE", w: 40, h: 20, fill: "#00FF00" }
+    ] },
+    { id: "title", type: "TEXT", x: 20, y: 10, w: 300, h: 40, text: "Hello", font: { family: "Inter", style: "Bold", size: 24 }, fills: [] },
+    { id: "styled", type: "TEXT", x: 20, y: 60, w: 300, h: 40, text: "Hi there", font: { family: "Inter", style: "Regular", size: 16 }, fill: "#111111", runs: [{ start: 0, end: 2, font: { style: "Bold" } }] },
+    { id: "card", type: "RECTANGLE", x: 400, y: 10, w: 100, h: 100, effects: [{ type: "DROP_SHADOW", color: "#00000033", offset: { x: 0, y: 4 }, blur: 8 }, { type: "LAYER_BLUR", blur: 4 }] },
+    { id: "group", type: "GROUP", x: 600, y: 10, w: 50, h: 50, children: [{ id: "in-group", type: "RECTANGLE", w: 10, h: 10 }] }
+  ]
+});
+
+test("PATCH_SET_KEYS is the single source of truth and matches schema node props", () => {
+  const specSchema = JSON.parse(readFileSync("../../spec/compact-design.schema.json", "utf8"));
+  const nodeKeys = Object.keys(specSchema.$defs.node.properties);
+  const expected = nodeKeys.filter((key) => !(PATCH_SET_EXCLUDED_NODE_KEYS as readonly string[]).includes(key));
+  assert.deepEqual([...PATCH_SET_KEYS], expected);
+  assert.deepEqual(Object.keys(specSchema.$defs.patchSet.properties), expected);
+  assert.equal(specSchema.$defs.patchSet.additionalProperties, false);
+  assert.deepEqual(Object.keys(PATCH_SET_SEMANTICS).sort(), [...PATCH_SET_KEYS].sort());
+  assert.deepEqual(Object.keys(PATCH_SET_APPLIES_TO).sort(), [...PATCH_SET_KEYS].sort());
+  // Every patchSet property schema is the node property schema, except the partial
+  // nested patches and descriptions documenting deferred/immutable keys.
+  const mergePatchKeys = new Set(["bindings", "styleRefs", "variableModes", "instanceProperties", "componentPropertyReferences", "componentProperties", "variantAxes", "variant"]);
+  for (const key of expected) {
+    const { description: _description, ...patchProperty } = specSchema.$defs.patchSet.properties[key];
+    if (key === "layout") assert.deepEqual(patchProperty, { $ref: "#/$defs/layoutPatch" });
+    else if (key === "constraints") assert.deepEqual(patchProperty, { $ref: "#/$defs/constraintsPatch" });
+    else if (key === "font") assert.deepEqual(patchProperty, { $ref: "#/$defs/fontPatch" });
+    else if (key === "componentProperties") {
+      assert.ok(Array.isArray(patchProperty.oneOf), "componentProperties allows null / name-keyed upsert");
+    } else if (key === "variantAxes") {
+      assert.equal(patchProperty.type, "object", key);
+      assert.ok(Array.isArray(patchProperty.additionalProperties?.oneOf), "variantAxes entries allow array | object | null");
+    } else if (key === "variant") {
+      assert.ok(Array.isArray(patchProperty.oneOf), "variant allows null clear (rejected at apply)");
+    } else if (mergePatchKeys.has(key)) {
+      assert.ok(Array.isArray(patchProperty.oneOf), `${key} patch schema allows null clear via oneOf`);
+      assert.ok(patchProperty.oneOf.some((entry: { type?: string }) => entry.type === "null"), `${key} allows null`);
+    }
+    else assert.deepEqual(patchProperty, specSchema.$defs.node.properties[key], key);
+  }
+  assert.equal(specSchema.$defs.layoutPatch.required, undefined);
+  assert.deepEqual(specSchema.$defs.patchOperation.oneOf[0].properties.set, { $ref: "#/$defs/patchSet" });
+  assert.deepEqual([...PATCH_SET_DEFERRED_KEYS], ["componentId"]);
+});
+
+test("a typo set key fails in the schema and in core", () => {
+  const typo = patchOf(setOp("title", { txet: "Oops" }));
+  const result = validate(typo);
+  assert.equal(result.valid, false);
+  assert.ok(result.issues.some((issue) => issue.code === "SCHEMA_ADDITIONALPROPERTIES" && issue.path.includes("/set")));
+  // The first issue names the offending key precisely, ahead of the oneOf noise.
+  assert.equal(result.issues[0].code, "PATCH_SET_UNSUPPORTED");
+  assert.equal(result.issues[0].path, "patch.operations[0].set.txet");
+  assert.match(result.issues[0].message, /unknown set key 'txet'/);
+  assert.throws(() => normalizePatch(typo), /unknown set key 'txet'/);
+  rejects(baseDocument(), /additional properties/, setOp("title", { txet: "Oops" }));
+  // Nested typos fail too.
+  assert.equal(validate(patchOf(setOp("stack", { layout: { itemSpaceing: 4 } }))).valid, false);
+  assert.equal(validate(patchOf(setOp("title", { font: { weight: 700 } }))).valid, false);
+  assert.equal(validate(patchOf(setOp("title", { font: {} }))).valid, false);
+  assert.throws(() => normalizePatch(patchOf(setOp("title", { font: {} }))), /non-empty object/);
+});
+
+test("patch documents no longer short-circuit validation", () => {
+  // Still rejected: deferred keys, immutable svg, and conflicting fill+fills.
+  for (const set of [{ svg: "<svg/>" }, { fill: "#000000", fills: ["#FFFFFF"] }, { componentId: "x" }]) {
+    const result = validate(patchOf(setOp("title", set)));
+    assert.equal(result.valid, false, JSON.stringify(set));
+  }
+  const deferred = validate(patchOf(setOp("title", { componentId: "x" })));
+  assert.equal(deferred.issues[0].code, "PATCH_SET_UNSUPPORTED");
+  assert.equal(deferred.issues[0].path, "patch.operations[0].set.componentId");
+  assert.match(deferred.issues[0].message, /cannot be patched yet/);
+  // Newly patchable object keys pass shape validation (target rules run at apply).
+  assert.equal(validate(patchOf(setOp("title", { bindings: { fill: "brand" } }))).valid, true);
+  assert.equal(validate(patchOf(setOp("title", { styleRefs: { fill: "Brand" } }))).valid, true);
+  assert.equal(validate(patchOf(setOp("title", { instanceProperties: { Label: "x" } }))).valid, true);
+  assert.equal(validate(patchOf(setOp("title", { componentProperties: { Label: { type: "TEXT", defaultValue: "Hi" } } }))).valid, true);
+  assert.equal(validate(patchOf(setOp("title", { variantAxes: { State: ["A"] } }))).valid, true);
+  assert.equal(validate(patchOf(setOp("title", { variant: { State: "A" } }))).valid, true);
+});
+
+test("set on TEXT adds no defaults: no fill injection and no Arial", () => {
+  const document = baseDocument();
+  const normalized = normalizePatch(patchOf(setOp("title", { text: "Changed" }))).patch.operations[0].normalized!;
+  assert.deepEqual(normalized, { text: "Changed" });
+  const after = applyRaw(document, setOp("title", { text: "Changed" }));
+  assert.deepEqual(nodeById(after, "title").properties.styles.fills, []);
+  assert.deepEqual(nodeById(after, "title").properties.font, { family: "Inter", style: "Bold", size: 24 });
+  const shape = applyRaw(document, setOp("card", { cornerRadius: 4 }));
+  assert.deepEqual(nodeById(shape, "card").properties.styles.fills, [], "no fill default on other types either");
+});
+
+test("{font:{size:32}} keeps family and style; partial fonts merge", () => {
+  const document = baseDocument();
+  const sized = applyRaw(document, setOp("title", { font: { size: 32 } }));
+  assert.deepEqual(nodeById(sized, "title").properties.font, { family: "Inter", style: "Bold", size: 32 });
+  const restyled = applyRaw(document, setOp("title", { font: { style: "Regular" } }));
+  assert.deepEqual(nodeById(restyled, "title").properties.font, { family: "Inter", style: "Regular", size: 24 });
+});
+
+test("{layout:{itemSpacing:24}} keeps direction and padding; padding merges per side", () => {
+  const document = baseDocument();
+  const spaced = applyRaw(document, setOp("stack", { layout: { itemSpacing: 24 } }));
+  assert.deepEqual(nodeById(spaced, "stack").properties.layout, { direction: "HORIZONTAL", itemSpacing: 24, padding: { left: 16, top: 12, right: 16, bottom: 12 }, primaryAxisAlignItems: "CENTER" });
+  const padded = applyRaw(document, setOp("stack", { layout: { padding: { left: 40 } } }));
+  assert.deepEqual(nodeById(padded, "stack").properties.layout?.padding, { left: 40, top: 12, right: 16, bottom: 12 });
+  assert.equal(nodeById(padded, "stack").properties.layout?.itemSpacing, 8);
+});
+
+test("partial layout on a frame without Auto Layout errors unless direction is given", () => {
+  const document = baseDocument();
+  rejects(document, /set\.layout\.direction.*no Auto Layout yet/, setOp("outer", { layout: { itemSpacing: 12 } }));
+  const enabled = applyRaw(document, setOp("outer", { layout: { direction: "VERTICAL", itemSpacing: 12 } }));
+  assert.deepEqual(nodeById(enabled, "outer").properties.layout, { direction: "VERTICAL", itemSpacing: 12 });
+  rejects(document, /does not apply to RECTANGLE/, setOp("leaf", { layout: { direction: "VERTICAL" } }));
+  const stretch = patchOf(setOp("stack", { layout: { counterAxisAlignItems: "STRETCH" } }));
+  assert.equal(validate(stretch).valid, false, "schema layoutPatch excludes STRETCH");
+  assert.throws(() => normalizePatch(stretch), /STRETCH cannot be patched yet/);
+});
+
+test("constraints deep-merge over the Figma default", () => {
+  const document = baseDocument();
+  const once = applyRaw(document, setOp("leaf", { constraints: { horizontal: "CENTER" } }));
+  assert.deepEqual(nodeById(once, "leaf").properties.constraints, { horizontal: "CENTER", vertical: "MIN" });
+  const twice = applyRaw(once, setOp("leaf", { constraints: { vertical: "MAX" } }));
+  assert.deepEqual(nodeById(twice, "leaf").properties.constraints, { horizontal: "CENTER", vertical: "MAX" });
+});
+
+test("effects, shadow and elevation replace the whole effect list", () => {
+  const document = baseDocument();
+  assert.equal(nodeById(document, "card").properties.styles.effects.length, 2);
+  const shadowed = applyRaw(document, setOp("card", { shadow: { y: 2, blur: 6 } }));
+  assert.deepEqual(nodeById(shadowed, "card").properties.styles.effects.map((effect) => [effect.type, effect.radius, effect.offset?.y]), [["DROP_SHADOW", 6, 2]]);
+  const cleared = applyRaw(document, setOp("card", { effects: [] }));
+  assert.deepEqual(nodeById(cleared, "card").properties.styles.effects, []);
+  const elevated = applyRaw(document, setOp("card", { elevation: "FLOATING" }));
+  assert.equal(nodeById(elevated, "card").properties.styles.effects.length, 2);
+  const fills = applyRaw(document, setOp("leaf", { fills: ["#000000", "#FFFFFF"] }));
+  assert.equal(nodeById(fills, "leaf").properties.styles.fills.length, 2, "fills replace, not append");
+});
+
+test("runs vs text: text is content, runs style ranges; styled targets reject content changes", () => {
+  const document = baseDocument();
+  const both = applyRaw(document, setOp("title", { text: "Big deal", runs: [{ start: 0, end: 3, font: { size: 40 } }] }));
+  assert.equal(nodeById(both, "title").properties.text, "Big deal");
+  assert.deepEqual(nodeById(both, "title").properties.runs, [{ start: 0, end: 3, font: { size: 40 } }]);
+  const runsOnly = applyRaw(document, setOp("title", { runs: [{ text: "One " }, { text: "two", fill: "#FF0000" }] }));
+  assert.equal(nodeById(runsOnly, "title").properties.text, "One two");
+  rejects(document, /every run must carry its own text/, setOp("title", { runs: [{ start: 0, end: 2 }] }));
+  rejects(document, /per-range text styling/, setOp("styled", { text: "New" }));
+  // Node-level typography on a styled node applies to the whole text: run overrides of that attribute clear.
+  const restyled = applyRaw(document, setOp("styled", { font: { family: "Roboto", style: "Medium" } }));
+  assert.deepEqual(nodeById(restyled, "styled").properties.runs, [{ start: 0, end: 2 }]);
+  rejects(document, /set font.family and font.style together/, setOp("styled", { font: { family: "Roboto" } }));
+  const sized = applyRaw(document, setOp("styled", { font: { size: 20 } }));
+  assert.deepEqual(nodeById(sized, "styled").properties.runs, [{ start: 0, end: 2, font: { style: "Bold" } }]);
+});
+
+test("x/y are parent-relative at any depth and move the subtree", () => {
+  const document = baseDocument();
+  // screen(0,0) > outer(100,40) > inner(+50,+30) > leaf(+10,+5)
+  assert.deepEqual(nodeById(document, "leaf").properties.position, { x: 160, y: 75 });
+  const moved = applyRaw(document, setOp("leaf", { x: 20 }));
+  assert.deepEqual(nodeById(moved, "leaf").properties.position, { x: 170, y: 75 }, "x relative to inner; y untouched");
+  const innerMoved = applyRaw(document, setOp("inner", { x: 0, y: 0 }));
+  assert.deepEqual(nodeById(innerMoved, "inner").properties.position, { x: 100, y: 40 });
+  assert.deepEqual(nodeById(innerMoved, "leaf").properties.position, { x: 110, y: 45 }, "descendants keep their relative offset");
+  const inserted = applyRaw(document, { op: "insert", parent: "inner", index: 0, node: { id: "new", type: "RECTANGLE", x: 1, y: 2, w: 5, h: 5, children: [] } });
+  assert.deepEqual(nodeById(inserted, "new").properties.position, { x: 151, y: 72 }, "inserted nodes are parent-relative too");
+  rejects(document, /children of a GROUP cannot be positioned/, setOp("in-group", { x: 1 }));
+  rejects(document, /parent uses Auto Layout/, setOp("chip", { x: 5 }));
+  const absolute = applyRaw(document, setOp("chip", { layoutPositioning: "ABSOLUTE", x: 5, y: 6 }));
+  assert.deepEqual(nodeById(absolute, "chip").properties.position, { x: 5, y: 466 });
+});
+
+test("move keeps parent-relative x/y, then set x is relative to the new parent", () => {
+  const document = baseDocument();
+  const result = applyRaw(document, { op: "move", id: "leaf", parent: "sibling", index: 0 }, setOp("leaf", { x: 7 }));
+  // sibling at (100+200, 40+250) = (300, 290); leaf keeps y offset 5, x becomes 7.
+  assert.deepEqual(nodeById(result, "leaf").properties.position, { x: 307, y: 295 });
+});
+
+test("set rejects keys that do not apply to the target type; bound/style overwrite detaches with WARNING", () => {
+  const document = baseDocument();
+  rejects(document, /'text' does not apply to RECTANGLE/, setOp("leaf", { text: "x" }));
+  rejects(document, /'w' does not apply to GROUP/, setOp("group", { w: 80 }));
+  rejects(document, /FILL requires an Auto Layout parent/, setOp("leaf", { layoutSizingHorizontal: "FILL" }));
+  rejects(document, /only applies to children of an Auto Layout parent/, setOp("leaf", { layoutGrow: 1 }));
+  rejects(document, /node 'missing' was not found/, setOp("missing", { name: "x" }));
+  const bound = normalize({
+    canvas: { width: 100, height: 100 },
+    variables: [{ name: "Tokens", items: [{ id: "brand", name: "brand", type: "COLOR", value: { r: 1, g: 2, b: 3 } }, { id: "size", name: "size", type: "FLOAT", value: 10 }] }],
+    styles: [{ id: "body", name: "Body", type: "TEXT", font: { family: "Inter", style: "Regular", size: 14 } }],
+    nodes: [
+      { id: "box", type: "RECTANGLE", w: 10, h: 10, fill: "#010203", bindings: { fill: "brand", width: "size" } },
+      { id: "copy", type: "TEXT", w: 10, h: 10, text: "x", styleRefs: { text: "body" } }
+    ]
+  });
+  const widened = applyPatch(bound, normalizePatch(patchOf(setOp("box", { w: 20 }))));
+  assert.equal(nodeById(widened.document, "box").properties.size.width, 20);
+  assert.equal(nodeById(widened.document, "box").properties.bindings?.width, undefined);
+  assert.ok(widened.warnings.some((w) => /detached bindings\.width/.test(w)));
+  const restyled = applyPatch(bound, normalizePatch(patchOf(setOp("copy", { font: { size: 20 } }))));
+  assert.equal(nodeById(restyled.document, "copy").properties.styleRefs?.text, undefined);
+  assert.ok(restyled.warnings.some((w) => /detached styleRefs\.text/.test(w)));
+  const recoloured = applyPatch(bound, normalizePatch(patchOf(setOp("box", { fill: "#FFFFFF" }))));
+  assert.deepEqual(nodeById(recoloured.document, "box").properties.bindings, { width: "size" }, "setting fill detaches the fill binding, as in Figma");
+  assert.ok(recoloured.warnings.some((w) => /detached bindings\.fill/.test(w)), "fill detach emits a WARNING");
+});
+
+test("patch merges bindings/styleRefs/variableModes; null clears a single key", () => {
+  const document = normalize({
+    canvas: { width: 100, height: 100 },
+    variables: [{ name: "Tokens", modes: ["Light", "Dark"], items: [
+      { id: "brand", name: "brand", type: "COLOR", values: { Light: { r: 1, g: 0, b: 0 }, Dark: { r: 0, g: 0, b: 1 } } },
+      { id: "ink", name: "ink", type: "COLOR", values: { Light: { r: 0, g: 0, b: 0 }, Dark: { r: 1, g: 1, b: 1 } } },
+      { id: "gap", name: "gap", type: "FLOAT", values: { Light: 8, Dark: 12 } }
+    ] }],
+    styles: [{ id: "ink-style", name: "Ink", type: "PAINT", paints: ["#111111"] }],
+    nodes: [{ id: "box", type: "FRAME", w: 40, h: 40, fill: "#FFFFFF", bindings: { fill: "brand", width: "gap" }, styleRefs: { stroke: "ink-style" }, variableModes: { Tokens: "Light" } }]
+  });
+  const merged = applyPatch(document, normalizePatch(patchOf(setOp("box", {
+    bindings: { opacity: "gap", fill: null },
+    styleRefs: { fill: "ink-style" },
+    variableModes: { Tokens: "Dark" }
+  }))));
+  assert.deepEqual(nodeById(merged.document, "box").properties.bindings, { width: "gap", opacity: "gap" });
+  assert.deepEqual(nodeById(merged.document, "box").properties.styleRefs, { stroke: "ink-style", fill: "ink-style" });
+  assert.deepEqual(nodeById(merged.document, "box").properties.variableModes, { Tokens: "Dark" });
+  const cleared = applyPatch(merged.document, normalizePatch(patchOf(setOp("box", { bindings: null, styleRefs: { stroke: null } }))));
+  assert.equal(nodeById(cleared.document, "box").properties.bindings, undefined);
+  assert.deepEqual(nodeById(cleared.document, "box").properties.styleRefs, { fill: "ink-style" });
+});
+
+test("patch instanceProperties and componentPropertyReferences merge with validation", () => {
+  const document = normalize({
+    canvas: { width: 200, height: 100 },
+    nodes: [
+      { id: "icon-a", type: "COMPONENT", name: "IconA", w: 16, h: 16, fill: "#000000" },
+      { id: "icon-b", type: "COMPONENT", name: "IconB", w: 16, h: 16, fill: "#FF0000" },
+      {
+        id: "button", type: "COMPONENT", name: "Button", w: 120, h: 40, fill: "#2563EB",
+        componentProperties: [
+          { name: "Label", type: "TEXT", defaultValue: "Go" },
+          { name: "ShowIcon", type: "BOOLEAN", defaultValue: true },
+          { name: "Icon", type: "INSTANCE_SWAP", defaultValue: "icon-a" }
+        ],
+        children: [
+          { id: "button-label", type: "TEXT", name: "Label", w: 80, h: 20, text: "Go", fill: "#FFFFFF", componentPropertyReferences: { characters: "Label" } },
+          { id: "button-icon", type: "INSTANCE", name: "Icon", componentId: "icon-a", w: 16, h: 16, componentPropertyReferences: { visible: "ShowIcon", mainComponent: "Icon" } }
+        ]
+      },
+      { id: "cta", type: "INSTANCE", componentId: "button", w: 120, h: 40, instanceProperties: { Label: "Continue", ShowIcon: true, Icon: "icon-a" } }
+    ]
+  });
+  const patched = applyPatch(document, normalizePatch(patchOf(
+    setOp("cta", { instanceProperties: { Label: "Submit", Icon: "icon-b", ShowIcon: null } }),
+    setOp("button-label", { componentPropertyReferences: { visible: "ShowIcon" } })
+  )));
+  assert.deepEqual(nodeById(patched.document, "cta").properties.instanceProperties, { Label: "Submit", Icon: "icon-b" });
+  assert.deepEqual(nodeById(patched.document, "button-label").properties.componentPropertyReferences, { characters: "Label", visible: "ShowIcon" });
+  rejects(document, /missing-icon|INSTANCE_SWAP|not defined|is a /, setOp("cta", { instanceProperties: { Icon: "missing-icon" } }));
+  rejects(document, /Nope|not defined|unknown/, setOp("button-label", { componentPropertyReferences: { characters: "Nope" } }));
+});
+
+
+test("patch componentProperties name-keyed upsert, immutable type, delete + referenced fails", () => {
+  const document = normalize({
+    canvas: { width: 200, height: 100 },
+    nodes: [
+      { id: "icon", type: "COMPONENT", w: 8, h: 8, fill: "#000" },
+      {
+        id: "button", type: "COMPONENT", w: 80, h: 32, fill: "#00F",
+        componentProperties: [
+          { name: "Label", type: "TEXT", defaultValue: "Go" },
+          { name: "Show", type: "BOOLEAN", defaultValue: true }
+        ],
+        children: [
+          { id: "label", type: "TEXT", w: 40, h: 16, text: "Go", fill: "#FFF", componentPropertyReferences: { characters: "Label" } }
+        ]
+      }
+    ]
+  });
+  const added = applyPatch(document, normalizePatch(patchOf(setOp("button", {
+    componentProperties: {
+      Label: { defaultValue: "Continue" },
+      Icon: { type: "INSTANCE_SWAP", defaultValue: "icon" }
+    }
+  }))));
+  const props = nodeById(added.document, "button").properties.componentProperties!;
+  assert.deepEqual(props.find((p) => p.name === "Label")?.defaultValue, "Continue");
+  assert.ok(props.find((p) => p.name === "Icon" && p.type === "INSTANCE_SWAP"));
+  rejects(document, /type is immutable/, setOp("button", { componentProperties: { Label: { type: "BOOLEAN", defaultValue: false } } }));
+  rejects(document, /not defined on the owning COMPONENT|property 'Label'/, setOp("button", { componentProperties: { Label: null } }));
+  const dropped = applyPatch(document, normalizePatch(patchOf(setOp("button", { componentProperties: { Show: null } }))));
+  assert.equal(nodeById(dropped.document, "button").properties.componentProperties!.some((p) => p.name === "Show"), false);
+});
+
+test("patch variantAxes merge, explicit rename, reject axis delete; variant merge rewrites names", () => {
+  const document = normalize({
+    canvas: { width: 400, height: 200 },
+    nodes: [{
+      id: "set", type: "COMPONENT_SET", w: 300, h: 100,
+      variantAxes: { State: ["Default", "Hover"], Size: ["S", "L"] },
+      children: [
+        { id: "d-s", type: "COMPONENT", w: 40, h: 20, variant: { State: "Default", Size: "S" }, fill: "#111" },
+        { id: "h-l", type: "COMPONENT", w: 40, h: 20, variant: { State: "Hover", Size: "L" }, fill: "#222" }
+      ]
+    },
+    { id: "use", type: "INSTANCE", componentId: "h-l", w: 40, h: 20 }
+    ]
+  });
+  assert.match(nodeById(document, "d-s").name, /State=Default/);
+  rejects(document, /deleting a variant axis is not supported/, setOp("set", { variantAxes: { Size: null } }));
+  // Plain array replacement is NOT a rename — removing Hover while a child still uses it errors.
+  rejects(document, /removed without renameOptions|not carried/, setOp("set", { variantAxes: { State: ["Default", "Pressed"] } }));
+  const renamed = applyPatch(document, normalizePatch(patchOf(setOp("set", {
+    variantAxes: { State: { rename: "Status", options: ["Default", "Pressed"], renameOptions: { Hover: "Pressed" } } }
+  }))));
+  assert.deepEqual(nodeById(renamed.document, "set").properties.variantAxes, { Status: ["Default", "Pressed"], Size: ["S", "L"] });
+  assert.deepEqual(nodeById(renamed.document, "h-l").properties.variant, { Status: "Pressed", Size: "L" });
+  assert.match(nodeById(renamed.document, "h-l").name, /Status=Pressed/);
+  // Swap d-s onto Pressed while h-l moves to Default so every option stays carried.
+  const selected = applyPatch(document, normalizePatch(patchOf(
+    setOp("d-s", { variant: { State: "Hover" } }),
+    setOp("h-l", { variant: { State: "Default" } })
+  )));
+  assert.deepEqual(nodeById(selected.document, "d-s").properties.variant, { State: "Hover", Size: "S" });
+  assert.deepEqual(nodeById(selected.document, "h-l").properties.variant, { State: "Default", Size: "L" });
+  rejects(document, /not declared/, setOp("d-s", { variant: { State: "Nope" } }));
+  rejects(document, /clearing variant|not supported/, setOp("d-s", { variant: null as never }));
+});
+
+test("variantAxes rename scopes instance rewrites to the patched set only", () => {
+  const document = normalize({
+    canvas: { width: 400, height: 200 },
+    nodes: [
+      {
+        id: "set-a", type: "COMPONENT_SET", w: 100, h: 40,
+        variantAxes: { Size: ["S", "M"] },
+        children: [
+          { id: "as", type: "COMPONENT", w: 40, h: 20, variant: { Size: "S" } },
+          { id: "am", type: "COMPONENT", w: 40, h: 20, variant: { Size: "M" } }
+        ]
+      },
+      {
+        id: "set-b", type: "COMPONENT_SET", w: 100, h: 40, x: 120,
+        variantAxes: { Size: ["S", "M"] },
+        children: [
+          { id: "bs", type: "COMPONENT", w: 40, h: 20, variant: { Size: "S" } },
+          { id: "bm", type: "COMPONENT", w: 40, h: 20, variant: { Size: "M" } }
+        ]
+      },
+      { id: "ia", type: "INSTANCE", componentId: "as", w: 40, h: 20, instanceProperties: { Size: "S" } },
+      { id: "ib", type: "INSTANCE", componentId: "bs", x: 120, w: 40, h: 20, instanceProperties: { Size: "S" } }
+    ]
+  });
+  const patched = applyPatch(document, normalizePatch(patchOf(setOp("set-a", {
+    variantAxes: { Size: { options: ["Small", "M"], renameOptions: { S: "Small" } } }
+  }))));
+  assert.deepEqual(nodeById(patched.document, "set-a").properties.variantAxes, { Size: ["Small", "M"] });
+  assert.deepEqual(nodeById(patched.document, "ia").properties.instanceProperties, { Size: "Small" });
+  assert.deepEqual(nodeById(patched.document, "ib").properties.instanceProperties, { Size: "S" }, "set B instance untouched");
+  assert.deepEqual(nodeById(patched.document, "set-b").properties.variantAxes, { Size: ["S", "M"] });
+});
+
+test("variantAxes rejects uncarried options; same-patch child variant can carry them", () => {
+  const document = normalize({
+    canvas: { width: 200, height: 100 },
+    nodes: [{
+      id: "set", type: "COMPONENT_SET", w: 100, h: 40,
+      variantAxes: { State: ["Default", "Hover"] },
+      children: [
+        { id: "d", type: "COMPONENT", w: 40, h: 20, variant: { State: "Default" } },
+        { id: "h", type: "COMPONENT", w: 40, h: 20, variant: { State: "Hover" } }
+      ]
+    }]
+  });
+  rejects(document, /not carried by any variant child/, setOp("set", { variantAxes: { State: ["Default", "Hover", "Pressed"] } }));
+  // Same patch: declare Pressed, then insert a child that carries it (Hover/Default stay carried).
+  const ok = applyPatch(document, normalizePatch(patchOf(
+    setOp("set", { variantAxes: { State: ["Default", "Hover", "Pressed"] } }),
+    { op: "append", parent: "set", node: { id: "p", type: "COMPONENT", w: 40, h: 20, variant: { State: "Pressed" } } }
+  )));
+  assert.deepEqual(nodeById(ok.document, "set").properties.variantAxes, { State: ["Default", "Hover", "Pressed"] });
+  assert.deepEqual(nodeById(ok.document, "p").properties.variant, { State: "Pressed" });
+});
+
+test("validatePatch reports bad references in the patched document", () => {
+  const document = baseDocument();
+  const issues = rejects(document, /component 'ghost' is not defined/, { op: "append", parent: "sibling", node: { id: "inst", type: "INSTANCE", componentId: "ghost", w: 5, h: 5 } });
+  assert.equal(issues[0].code, "PATCH_RESULT_INVALID");
+  rejects(document, /variable 'nope' is not defined/, { op: "append", parent: "sibling", node: { id: "b", type: "RECTANGLE", w: 5, h: 5, bindings: { fill: "nope" } } });
+  rejects(document, /style 'Nope' is not defined/, { op: "append", parent: "sibling", node: { id: "s", type: "RECTANGLE", w: 5, h: 5, styleRefs: { fill: "Nope" } } });
+  assert.throws(() => applyPatch(document, normalizePatch(patchOf({ op: "append", parent: "sibling", node: { id: "inst", type: "INSTANCE", componentId: "ghost", w: 5, h: 5 } }))), PatchError);
+});
+
+// A document that is already invalid before any patch: two missing variables,
+// plus valid components, an instance and two variant sets for indirect issues.
+const preInvalidDocument = () => normalize({
+  canvas: { id: "screen", width: 800, height: 600, fill: "#FFFFFF" },
+  variables: [{ name: "Theme", modes: ["Light"], items: [{ id: "ink", name: "ink", type: "COLOR", values: { Light: { r: 17, g: 17, b: 17 } } }] }],
+  nodes: [
+    { id: "a", type: "RECTANGLE", x: 0, y: 0, w: 10, h: 10, fill: "#FF0000", bindings: { fill: "missing-var" } },
+    { id: "b", type: "RECTANGLE", x: 20, y: 0, w: 10, h: 10, fill: "#00FF00" },
+    { id: "box", type: "FRAME", x: 0, y: 100, w: 300, h: 200, children: [
+      { id: "x", type: "RECTANGLE", x: 0, y: 0, w: 10, h: 10 },
+      { id: "y", type: "RECTANGLE", x: 20, y: 0, w: 10, h: 10, fill: "#0000FF", bindings: { fill: "missing-2" } }
+    ] },
+    { id: "other", type: "FRAME", x: 400, y: 100, w: 300, h: 200, children: [] },
+    { id: "comp", type: "COMPONENT", x: 0, y: 400, w: 40, h: 40 },
+    { id: "inst", type: "INSTANCE", x: 100, y: 400, w: 40, h: 40, componentId: "comp" },
+    { id: "set-sm", type: "COMPONENT_SET", x: 200, y: 400, w: 100, h: 50, variantAxes: { size: ["sm"] }, children: [
+      { id: "sm-1", type: "COMPONENT", w: 40, h: 40, variant: { size: "sm" } },
+      { id: "sm-2", type: "COMPONENT", x: 50, w: 40, h: 40, variant: { size: "sm" } }
+    ] },
+    { id: "set-lg", type: "COMPONENT_SET", x: 400, y: 400, w: 100, h: 50, variantAxes: { size: ["lg"] }, children: [
+      { id: "lg-1", type: "COMPONENT", w: 40, h: 40, variant: { size: "lg" } }
+    ] }
+  ]
+});
+const preExisting = /missing-var|missing-2/;
+
+test("post-patch validation ignores issues already in the input (Gate repro: missing variable on a, rename b)", () => {
+  const document = preInvalidDocument();
+  const before = validateDocument(document);
+  assert.equal(before.length, 2, before.join("; "));
+  assert.match(before.join("\n"), /variable 'missing-var' is not defined/);
+  const result = validatePatch(document, patchOf(setOp("b", { name: "renamed" })));
+  assert.equal(result.valid, true, result.issues.map((issue) => issue.message).join("; "));
+  assert.equal(nodeById(result.document!, "b").name, "renamed");
+  assert.deepEqual(validateDocument(result.document!), before, "pre-existing issues are still there, untouched, and not reported");
+  assert.doesNotThrow(() => applyPatch(document, normalizePatch(patchOf(setOp("b", { name: "renamed" })))));
+});
+
+test("post-patch validation still fails on issues the patch introduces and names only those", () => {
+  const document = preInvalidDocument();
+  const patch = patchOf(setOp("b", { name: "renamed" }), { op: "append", parent: "other", node: { id: "fresh", type: "RECTANGLE", w: 5, h: 5, bindings: { fill: "brand-new" } } });
+  const result = validatePatch(document, patch);
+  assert.equal(result.valid, false);
+  assert.equal(result.issues.length, 1, result.issues.map((issue) => issue.message).join("; "));
+  assert.equal(result.issues[0].code, "PATCH_RESULT_INVALID");
+  assert.match(result.issues[0].message, /node 'fresh'.*variable 'brand-new' is not defined/);
+  assert.doesNotMatch(JSON.stringify(result.issues), preExisting);
+  assert.throws(() => applyPatch(document, normalizePatch(patch)), (error: unknown) => error instanceof PatchError && error.issues.length === 1 && /brand-new/.test(error.message) && !preExisting.test(error.message));
+  // A second copy of an existing problem is new, too: the comparison is a multiset per node.
+  const copy = validatePatch(document, patchOf({ op: "append", parent: "other", node: { id: "twin", type: "RECTANGLE", w: 5, h: 5, bindings: { fill: "missing-var" } } }));
+  assert.equal(copy.valid, false);
+  assert.equal(copy.issues.length, 1);
+  assert.match(copy.issues[0].message, /node 'twin'/);
+  // The diff is uncapped: with more than 30 pre-existing issues a new one is still found.
+  const noisy = normalize({ canvas: { id: "screen", width: 800, height: 600 }, nodes: [
+    ...Array.from({ length: 35 }, (_, index) => ({ id: `n${index}`, type: "RECTANGLE", w: 5, h: 5, bindings: { fill: `gone-${index}` } })),
+    { id: "host", type: "FRAME", w: 50, h: 50, children: [] }
+  ] });
+  const late = validatePatch(noisy, patchOf({ op: "append", parent: "host", node: { id: "late", type: "RECTANGLE", w: 5, h: 5, bindings: { fill: "gone-late" } } }));
+  assert.equal(late.valid, false);
+  assert.deepEqual(late.issues.map((issue) => /gone-late/.test(issue.message)), [true]);
+});
+
+test("touching a node that already has an issue does not count that issue as new", () => {
+  const document = preInvalidDocument();
+  const result = validatePatch(document, patchOf(setOp("a", { name: "still broken", x: 5, opacity: 0.5 }), setOp("y", { name: "also broken", w: 12 })));
+  assert.equal(result.valid, true, result.issues.map((issue) => issue.message).join("; "));
+  assert.equal(validateDocument(result.document!).length, 2);
+  // Fixing the issue (replacing the bound fill detaches the binding) is fine as well.
+  const fixed = validatePatch(document, patchOf(setOp("a", { fill: "#123456" })));
+  assert.equal(fixed.valid, true);
+  assert.equal(validateDocument(fixed.document!).length, 1);
+});
+
+test("issue identity is node id + property path, so index shifts from insert, move and remove don't make old issues new", () => {
+  const document = preInvalidDocument();
+  const ok = (label: string, ...operations: unknown[]) => {
+    const result = validatePatch(document, patchOf(...operations));
+    assert.equal(result.valid, true, `${label}: ${result.issues.map((issue) => `${issue.path}: ${issue.message}`).join("; ")}`);
+    assert.equal(validateDocument(result.document!).length, 2, `${label}: pre-existing issues remain`);
+    return result.document!;
+  };
+  // (a) insert a sibling before nodes that already have issues: y's and a's paths both shift.
+  ok("insert in box", { op: "insert", parent: "box", index: 0, node: { id: "new-1", type: "RECTANGLE", w: 5, h: 5 } });
+  ok("insert at root", { op: "insert", parent: "screen", index: 0, node: { id: "new-2", type: "FRAME", w: 5, h: 5, children: [] } });
+  // (b) move and remove that shift indexes, including moving the broken node itself.
+  ok("reorder", { op: "move", id: "x", parent: "box", index: 1 });
+  ok("move broken node", { op: "move", id: "y", parent: "other", index: 0 });
+  ok("move ahead of a", { op: "move", id: "other", parent: "screen", index: 0 });
+  ok("remove sibling", { op: "remove", id: "x" });
+  ok("remove before a", { op: "remove", id: "b" }, { op: "remove", id: "other" });
+  // Index-shifting remove plus insert plus move in one patch.
+  ok("combined", { op: "remove", id: "x" }, { op: "insert", parent: "screen", index: 0, node: { id: "new-3", type: "RECTANGLE", w: 5, h: 5 } }, { op: "move", id: "a", parent: "other", index: 0 });
+});
+
+test("issues the patch causes on nodes it only touched indirectly are still reported", () => {
+  const document = preInvalidDocument();
+  // Removing a component breaks the untouched instance that uses it.
+  const removed = validatePatch(document, patchOf({ op: "remove", id: "comp" }));
+  assert.equal(removed.valid, false);
+  assert.equal(removed.issues.length, 1);
+  assert.match(removed.issues[0].message, /node 'inst'.*component 'comp' is not defined/);
+  // Moving a variant into a set that doesn't declare its value creates a new conflict.
+  const moved = validatePatch(document, patchOf({ op: "move", id: "sm-2", parent: "set-lg", index: 1 }));
+  assert.equal(moved.valid, false);
+  assert.equal(moved.issues.length, 1, moved.issues.map((issue) => issue.message).join("; "));
+  assert.match(moved.issues[0].message, /node 'sm-2'.*value 'sm' is not declared in variantAxes/);
+  assert.doesNotMatch(JSON.stringify([...removed.issues, ...moved.issues]), preExisting);
+});
+
+test("e2e: the showcase document goes through a sequence of set patches, validates, and round-trips", () => {
+  const original = normalize(fixture("design-language-showcase.json"));
+  assert.deepEqual(validateDocument(original), []);
+  const chartBefore = nodeById(original, "revenue-chart");
+  const chartTextBefore = chartBefore.children[0].properties.position;
+  const steps: unknown[][] = [
+    [setOp("revenue-chart", { x: 60, cornerRadius: 12 })],
+    [setOp("topbar", { layout: { itemSpacing: 24 } }), setOp("metric-row", { layout: { padding: { left: 4 } } })],
+    [setOp("upgrade-card", { fill: "#101828", effects: [] }), setOp("sidebar", { w: 280 })],
+    [setOp("main", { name: "Main content", opacity: 0.95 })],
+    [{ op: "move", id: "revenue-chart", parent: "main", index: 0 }, setOp("revenue-chart", { y: 400 })]
+  ];
+  let current = original;
+  for (const operations of steps) current = applyRaw(current, ...operations);
+  assert.deepEqual(validateDocument(current), []);
+  const main = nodeById(current, "main");
+  const chart = nodeById(current, "revenue-chart");
+  assert.equal(main.name, "Main content");
+  assert.deepEqual(chart.properties.position, { x: main.properties.position.x + 60, y: main.properties.position.y + 400 });
+  const chartText = chart.children[0].properties.position;
+  assert.deepEqual({ x: chartText.x - chart.properties.position.x, y: chartText.y - chart.properties.position.y }, { x: chartTextBefore.x - chartBefore.properties.position.x, y: chartTextBefore.y - chartBefore.properties.position.y }, "children ride along");
+  const topbar = nodeById(current, "topbar").properties.layout!;
+  assert.equal(topbar.itemSpacing, 24);
+  assert.equal(topbar.direction, nodeById(original, "topbar").properties.layout?.direction);
+  assert.deepEqual(nodeById(current, "metric-row").properties.layout?.padding, { ...nodeById(original, "metric-row").properties.layout?.padding, left: 4 });
+  // Round trip: the original is untouched and replaying the same sequence is deterministic.
+  assert.deepEqual(nodeById(original, "revenue-chart").properties.position, chartBefore.properties.position);
+  let replay = original;
+  for (const operations of steps) replay = applyRaw(replay, ...operations);
+  assert.deepEqual(replay, current);
+  // A patched document is a valid input for further patches.
+  assert.equal(validatePatch(current, patchOf(setOp("main", { opacity: 1 }))).valid, true);
+});
+
+
+test("componentPropertyReferences links children to owning COMPONENT properties", () => {
+  const source = {
+    canvas: { width: 400, height: 200 },
+    nodes: [
+      { id: "icon", type: "COMPONENT", w: 16, h: 16, fill: "#111111" },
+      {
+        id: "button",
+        type: "COMPONENT",
+        w: 160,
+        h: 48,
+        componentProperties: [
+          { name: "Label", type: "TEXT", defaultValue: "Continue" },
+          { name: "ShowIcon", type: "BOOLEAN", defaultValue: true },
+          { name: "Icon", type: "INSTANCE_SWAP", defaultValue: "icon" }
+        ],
+        children: [
+          { id: "label", type: "TEXT", w: 100, h: 20, text: "Continue", componentPropertyReferences: { characters: "Label" } },
+          { id: "icon-slot", type: "INSTANCE", componentId: "icon", w: 16, h: 16, componentPropertyReferences: { visible: "ShowIcon", mainComponent: "Icon" } }
+        ]
+      },
+      { id: "button-1", type: "INSTANCE", componentId: "button", w: 160, h: 48, instanceProperties: { Label: "Start free", ShowIcon: false } }
+    ]
+  };
+  const result = validate(source);
+  assert.equal(result.valid, true, JSON.stringify(result.issues, null, 2));
+  const document = normalize(source);
+  const canvasChildren = document.nodes[0].children;
+  const button = canvasChildren.find((node) => node.id === "button")!;
+  const instance = canvasChildren.find((node) => node.id === "button-1")!;
+  assert.deepEqual(button.children[0].properties.componentPropertyReferences, { characters: "Label" });
+  assert.deepEqual(button.children[1].properties.componentPropertyReferences, { visible: "ShowIcon", mainComponent: "Icon" });
+  assert.deepEqual(instance.properties.instanceProperties, { Label: "Start free", ShowIcon: false });
+});
+
+test("rejects componentPropertyReferences with wrong type, missing prop, wrong node type, or crossing INSTANCE", () => {
+  const baseProps = [
+    { name: "Label", type: "TEXT", defaultValue: "Hi" },
+    { name: "ShowIcon", type: "BOOLEAN", defaultValue: true },
+    { name: "Icon", type: "INSTANCE_SWAP", defaultValue: "icon" }
+  ];
+  const wrongType = validate({
+    canvas: { width: 100, height: 100 },
+    nodes: [{
+      id: "button", type: "COMPONENT", w: 40, h: 40, componentProperties: baseProps,
+      children: [{ id: "label", type: "TEXT", w: 20, h: 10, text: "Hi", componentPropertyReferences: { characters: "ShowIcon" } }]
+    }]
+  });
+  assert.equal(wrongType.valid, false);
+  assert.ok(wrongType.issues.some((issue) => /characters/.test(issue.path) && /TEXT/.test(issue.message)));
+
+  const missing = validate({
+    canvas: { width: 100, height: 100 },
+    nodes: [{
+      id: "button", type: "COMPONENT", w: 40, h: 40, componentProperties: baseProps,
+      children: [{ id: "label", type: "TEXT", w: 20, h: 10, text: "Hi", componentPropertyReferences: { characters: "Missing" } }]
+    }]
+  });
+  assert.equal(missing.valid, false);
+  assert.ok(missing.issues.some((issue) => /Missing/.test(issue.message)));
+
+  const wrongNode = validate({
+    canvas: { width: 100, height: 100 },
+    nodes: [{
+      id: "button", type: "COMPONENT", w: 40, h: 40, componentProperties: baseProps,
+      children: [{ id: "box", type: "RECTANGLE", w: 20, h: 10, componentPropertyReferences: { characters: "Label" } }]
+    }]
+  });
+  assert.equal(wrongNode.valid, false);
+  assert.ok(wrongNode.issues.some((issue) => /TEXT nodes/.test(issue.message)));
+
+  const crossing = validate({
+    canvas: { width: 100, height: 100 },
+    nodes: [
+      { id: "icon", type: "COMPONENT", w: 8, h: 8 },
+      {
+        id: "button", type: "COMPONENT", w: 40, h: 40, componentProperties: baseProps,
+        children: [{
+          id: "slot", type: "INSTANCE", componentId: "icon", w: 8, h: 8,
+          children: [{ id: "nested-text", type: "TEXT", w: 8, h: 8, text: "x", componentPropertyReferences: { characters: "Label" } }]
+        }]
+      }
+    ]
+  });
+  assert.equal(crossing.valid, false);
+  assert.ok(crossing.issues.some((issue) => /nested INSTANCE/.test(issue.message)));
+
+  const mainOnText = validate({
+    canvas: { width: 100, height: 100 },
+    nodes: [{
+      id: "button", type: "COMPONENT", w: 40, h: 40, componentProperties: baseProps,
+      children: [{ id: "label", type: "TEXT", w: 20, h: 10, text: "Hi", componentPropertyReferences: { mainComponent: "Icon" } }]
+    }]
+  });
+  assert.equal(mainOnText.valid, false);
+  assert.ok(mainOnText.issues.some((issue) => /INSTANCE nodes/.test(issue.message)));
+});
+
+test("rejects instanceProperties keys/types that do not match the main component", () => {
+  const missingKey = validate({
+    canvas: { width: 100, height: 100 },
+    nodes: [
+      { id: "button", type: "COMPONENT", w: 40, h: 40, componentProperties: [{ name: "Label", type: "TEXT", defaultValue: "Hi" }] },
+      { id: "copy", type: "INSTANCE", componentId: "button", w: 40, h: 40, instanceProperties: { Title: "Nope" } }
+    ]
+  });
+  assert.equal(missingKey.valid, false);
+  assert.ok(missingKey.issues.some((issue) => /Title/.test(issue.message)));
+
+  const wrongValue = validate({
+    canvas: { width: 100, height: 100 },
+    nodes: [
+      { id: "button", type: "COMPONENT", w: 40, h: 40, componentProperties: [{ name: "ShowIcon", type: "BOOLEAN", defaultValue: true }] },
+      { id: "copy", type: "INSTANCE", componentId: "button", w: 40, h: 40, instanceProperties: { ShowIcon: "yes" } }
+    ]
+  });
+  assert.equal(wrongValue.valid, false);
+  assert.ok(wrongValue.issues.some((issue) => /boolean/.test(issue.message)));
+});
+
+
+test("rejects INSTANCE_SWAP defaultValue or override that is missing or not a COMPONENT", () => {
+  const missingDefault = validate({
+    canvas: { width: 100, height: 100 },
+    nodes: [{
+      id: "button", type: "COMPONENT", w: 40, h: 40,
+      componentProperties: [{ name: "Icon", type: "INSTANCE_SWAP", defaultValue: "ghost-icon" }]
+    }]
+  });
+  assert.equal(missingDefault.valid, false);
+  assert.ok(missingDefault.issues.some((issue) => issue.path.includes("componentProperties") && /ghost-icon/.test(issue.message) && /not defined/.test(issue.message)));
+
+  const nonComponentDefault = validate({
+    canvas: { width: 100, height: 100 },
+    nodes: [
+      { id: "frame-slot", type: "FRAME", w: 16, h: 16 },
+      {
+        id: "button", type: "COMPONENT", w: 40, h: 40,
+        componentProperties: [{ name: "Icon", type: "INSTANCE_SWAP", defaultValue: "frame-slot" }]
+      }
+    ]
+  });
+  assert.equal(nonComponentDefault.valid, false);
+  assert.ok(nonComponentDefault.issues.some((issue) => issue.path.includes("componentProperties") && /frame-slot/.test(issue.message) && /FRAME/.test(issue.message) && /COMPONENT/.test(issue.message)));
+
+  const missingOverride = validate({
+    canvas: { width: 100, height: 100 },
+    nodes: [
+      { id: "icon", type: "COMPONENT", w: 8, h: 8 },
+      {
+        id: "button", type: "COMPONENT", w: 40, h: 40,
+        componentProperties: [{ name: "Icon", type: "INSTANCE_SWAP", defaultValue: "icon" }]
+      },
+      { id: "copy", type: "INSTANCE", componentId: "button", w: 40, h: 40, instanceProperties: { Icon: "missing-icon" } }
+    ]
+  });
+  assert.equal(missingOverride.valid, false);
+  assert.ok(missingOverride.issues.some((issue) => issue.path.includes("instanceProperties.Icon") && /missing-icon/.test(issue.message)));
+
+  const nonComponentOverride = validate({
+    canvas: { width: 100, height: 100 },
+    nodes: [
+      { id: "icon", type: "COMPONENT", w: 8, h: 8 },
+      { id: "frame-slot", type: "FRAME", w: 8, h: 8 },
+      {
+        id: "button", type: "COMPONENT", w: 40, h: 40,
+        componentProperties: [{ name: "Icon", type: "INSTANCE_SWAP", defaultValue: "icon" }]
+      },
+      { id: "copy", type: "INSTANCE", componentId: "button", w: 40, h: 40, instanceProperties: { Icon: "frame-slot" } }
+    ]
+  });
+  assert.equal(nonComponentOverride.valid, false);
+  assert.ok(nonComponentOverride.issues.some((issue) => issue.path.includes("instanceProperties.Icon") && /frame-slot/.test(issue.message) && /FRAME/.test(issue.message)));
+});
+
+test("set on a node inserted earlier in the same patch applies (lockstep with Figma)", () => {
+  const document = baseDocument();
+  const result = applyRaw(document, { op: "append", parent: "sibling", node: { id: "fresh", type: "RECTANGLE", w: 5, h: 5 } }, setOp("fresh", { w: 9 }));
+  assert.equal(nodeById(result, "fresh").properties.size.width, 9);
+});
+
+test("duplicate: single layer, subtree + same-patch set, ids override, default index after source", () => {
+  const document = normalize({
+    canvas: { width: 300, height: 200 },
+    nodes: [{ id: "list", type: "FRAME", w: 200, h: 100, children: [
+      { id: "card", type: "FRAME", w: 40, h: 40, children: [
+        { id: "title", type: "TEXT", w: 20, h: 10, text: "Hi" },
+        { id: "icon", type: "RECTANGLE", w: 8, h: 8 }
+      ] },
+      { id: "other", type: "RECTANGLE", w: 10, h: 10 }
+    ] }]
+  });
+  // Single-layer duplicate
+  const single = applyRaw(document, { op: "duplicate", id: "other", idSuffix: "-2" });
+  assert.deepEqual(childIds(single, "list"), ["card", "other", "other-2"]);
+  assert.equal(nodeById(single, "other-2").type, "RECTANGLE");
+
+  // Subtree + ids override + same-patch set on a child of the copy
+  const subtree = applyRaw(document,
+    { op: "duplicate", id: "card", idSuffix: "-copy", ids: { card: "card-featured", title: "title-featured" } },
+    setOp("title-featured", { text: "Featured" })
+  );
+  assert.deepEqual(childIds(subtree, "list"), ["card", "card-featured", "other"]);
+  assert.equal(nodeById(subtree, "title-featured").properties.text, "Featured");
+  assert.ok(findNode(subtree, "icon-copy"), "default suffix for non-overridden child");
+  assert.equal(nodeById(subtree, "title").properties.text, "Hi");
+});
+
+test("duplicate: top-level screen, parent/index defaults, keeps x/y", () => {
+  const document = normalize({
+    canvas: { id: "page", width: 800, height: 600 },
+    nodes: [
+      { id: "screen-a", type: "FRAME", x: 10, y: 20, w: 100, h: 80, children: [{ id: "btn", type: "RECTANGLE", x: 5, y: 5, w: 20, h: 10 }] },
+      { id: "screen-b", type: "FRAME", x: 200, y: 20, w: 100, h: 80, children: [] }
+    ]
+  });
+  const result = applyRaw(document, { op: "duplicate", id: "screen-a", idSuffix: "-2" });
+  assert.deepEqual(childIds(result, "page"), ["screen-a", "screen-a-2", "screen-b"]);
+  assert.deepEqual(nodeById(result, "screen-a-2").properties.position, { x: 10, y: 20 });
+  assert.deepEqual(nodeById(result, "btn-2").properties.position, { x: 15, y: 25 }, "absolute coords preserved");
+  // Duplicating a canvas root itself inserts a sibling at document.nodes (page level).
+  const multi = normalize({
+    canvases: [
+      { id: "screen-a", width: 100, height: 80, nodes: [{ id: "btn", type: "RECTANGLE", w: 20, h: 10 }] },
+      { id: "screen-b", width: 100, height: 80, nodes: [] }
+    ]
+  });
+  const canvases = applyRaw(multi, { op: "duplicate", id: "screen-a", idSuffix: "-2" });
+  assert.deepEqual(canvases.nodes.map((n) => n.id), ["screen-a", "screen-a-2", "screen-b"]);
+});
+
+test("duplicate: collisions, COMPONENT/COMPONENT_SET, inside INSTANCE, bad ids override", () => {
+  const document = normalize({
+    canvas: { width: 200, height: 200 },
+    nodes: [
+      { id: "host", type: "FRAME", w: 100, h: 100, children: [
+        { id: "card", type: "FRAME", w: 40, h: 40, children: [{ id: "dot", type: "RECTANGLE", w: 4, h: 4 }] },
+        { id: "card-2", type: "RECTANGLE", w: 10, h: 10 }
+      ] },
+      { id: "button", type: "COMPONENT", w: 20, h: 20 },
+      { id: "copy", type: "INSTANCE", componentId: "button", w: 20, h: 20 },
+      { id: "set", type: "COMPONENT_SET", w: 60, h: 40, variantAxes: { size: ["sm"] }, children: [
+        { id: "sm", type: "COMPONENT", w: 20, h: 20, variant: { size: "sm" } }
+      ] }
+    ]
+  });
+  rejects(document, /already exists/, { op: "duplicate", id: "card", idSuffix: "-2" });
+  rejects(document, /maps both/, { op: "duplicate", id: "card", idSuffix: "-x", ids: { card: "same", dot: "same" } });
+  rejects(document, /COMPONENT or COMPONENT_SET/, { op: "duplicate", id: "button", idSuffix: "-2" });
+  rejects(document, /COMPONENT or COMPONENT_SET/, { op: "duplicate", id: "set", idSuffix: "-2" });
+  // INSTANCE itself is not COMPONENT — but INSTANCE as source: brief says source that is or contains COMPONENT/COMPONENT_SET. INSTANCE is fine?
+  // "Source that is or contains COMPONENT/COMPONENT_SET -> error (v1). INSTANCEs inside are fine"
+  // So duplicating an INSTANCE root should be OK.
+  const withInstChild = normalize({
+    canvas: { width: 100, height: 100 },
+    nodes: [
+      { id: "button", type: "COMPONENT", w: 20, h: 20 },
+      { id: "wrap", type: "FRAME", w: 50, h: 50, children: [
+        { id: "inst", type: "INSTANCE", componentId: "button", w: 20, h: 20 }
+      ] }
+    ]
+  });
+  const dupInst = applyRaw(withInstChild, { op: "duplicate", id: "wrap", idSuffix: "-2" });
+  assert.equal(nodeById(dupInst, "inst-2").type, "INSTANCE");
+  assert.equal(nodeById(dupInst, "inst-2").properties.componentId, "button");
+
+  // Source inside INSTANCE
+  const inside = normalize({
+    canvas: { width: 100, height: 100 },
+    nodes: [
+      { id: "button", type: "COMPONENT", w: 40, h: 40, children: [{ id: "inner", type: "RECTANGLE", w: 10, h: 10 }] },
+      { id: "copy", type: "INSTANCE", componentId: "button", w: 40, h: 40 }
+    ]
+  });
+  // Instance children aren't in the document tree as editable nodes in Compact — skip if not present.
+  // Parent is INSTANCE
+  rejects(document, /INSTANCE/, { op: "duplicate", id: "card", idSuffix: "-z", parent: "copy" });
+  // ids override key not in subtree
+  rejects(document, /not an id in the source subtree/, { op: "duplicate", id: "card", idSuffix: "-z", ids: { ghost: "ghost-2" } });
+});
+
+test("duplicate: prototype destinations inside subtree are re-pointed; outside stay", () => {
+  const document = normalize({
+    canvas: { width: 400, height: 200 },
+    nodes: [
+      { id: "screen", type: "FRAME", w: 200, h: 100, children: [
+        { id: "btn", type: "FRAME", w: 40, h: 20, prototype: [{ trigger: "ON_CLICK", actions: [{ type: "NAVIGATE", destination: "panel" }] }] },
+        { id: "panel", type: "FRAME", w: 40, h: 40 }
+      ] },
+      { id: "other-screen", type: "FRAME", w: 100, h: 100, prototype: [{ trigger: "ON_CLICK", actions: [{ type: "NAVIGATE", destination: "screen" }] }] }
+    ]
+  });
+  const result = applyRaw(document, { op: "duplicate", id: "screen", idSuffix: "-2" });
+  const btn2 = nodeById(result, "btn-2").properties.prototype as Array<{ actions: Array<{ destination: string }> }>;
+  assert.equal(btn2[0].actions[0].destination, "panel-2");
+  const other = nodeById(result, "other-screen").properties.prototype as Array<{ actions: Array<{ destination: string }> }>;
+  assert.equal(other[0].actions[0].destination, "screen", "outside destination unchanged");
+  const btn = nodeById(result, "btn").properties.prototype as Array<{ actions: Array<{ destination: string }> }>;
+  assert.equal(btn[0].actions[0].destination, "panel", "source unchanged");
+});
+
+test("duplicate: pre-existing issues on source are exempt on the copy; genuinely new issues still fail", () => {
+  const document = normalize({
+    canvas: { width: 200, height: 100 },
+    nodes: [{ id: "host", type: "FRAME", w: 100, h: 80, children: [
+      { id: "broken", type: "RECTANGLE", w: 10, h: 10, fill: "#FF0000", bindings: { fill: "missing-var" } },
+      { id: "ok", type: "RECTANGLE", w: 10, h: 10 }
+    ] }]
+  });
+  assert.equal(validateDocument(document).length, 1);
+  const ok = validatePatch(document, patchOf({ op: "duplicate", id: "broken", idSuffix: "-2" }));
+  assert.equal(ok.valid, true, ok.issues.map((i) => i.message).join("; "));
+  assert.equal(validateDocument(ok.document!).length, 2, "source + copy both still have the issue");
+
+  // Genuinely new issue on the copy (different missing var) fails
+  const bad = validatePatch(document, patchOf(
+    { op: "duplicate", id: "ok", idSuffix: "-2" },
+    setOp("ok-2", { bindings: { fill: "brand-new" } })
+  ));
+  assert.equal(bad.valid, false);
+  assert.match(bad.issues.map((i) => i.message).join("\n"), /ok-2.*brand-new/);
+});
+
+test("duplicate: IMAGE keeps imageHash (reuse, not re-upload)", () => {
+  const document = normalize({
+    canvas: { width: 100, height: 100 },
+    nodes: [{ id: "photo", type: "RECTANGLE", w: 40, h: 40, fills: [{ type: "IMAGE", imageHash: "abc123", scaleMode: "FILL" }] }]
+  });
+  const result = applyRaw(document, { op: "duplicate", id: "photo", idSuffix: "-2" });
+  const fills = nodeById(result, "photo-2").properties.styles.fills as Array<{ imageHash?: string }>;
+  assert.equal(fills[0]?.imageHash, "abc123");
+});
+
+
+test("duplicate into a different parent keeps parent-relative x/y (Gate #41 repro)", () => {
+  const document = normalize({
+    canvas: { id: "page", width: 800, height: 400 },
+    nodes: [
+      { id: "A", type: "FRAME", x: 0, y: 0, w: 100, h: 100, children: [
+        { id: "box", type: "RECTANGLE", x: 10, y: 10, w: 20, h: 20 }
+      ] },
+      { id: "B", type: "FRAME", x: 300, y: 100, w: 100, h: 100, children: [] }
+    ]
+  });
+  const result = applyRaw(document, { op: "duplicate", id: "box", idSuffix: "-2", parent: "B" });
+  assert.deepEqual(childIds(result, "B"), ["box-2"]);
+  // Absolute = B origin + source-relative (10,10)
+  assert.deepEqual(nodeById(result, "box-2").properties.position, { x: 310, y: 110 });
+  // Same-parent duplicate does not shift
+  const same = applyRaw(document, { op: "duplicate", id: "box", idSuffix: "-s" });
+  assert.deepEqual(nodeById(same, "box-s").properties.position, { x: 10, y: 10 });
+});
+
+test("remapIssueKeyThroughDuplicate uses exact owner and delimited ids (no substring corruption)", () => {
+  const map = new Map([["card", "card-2"], ["card-title", "card-title-2"], ["a", "a-2"]]);
+  // Owner remaps exactly
+  assert.equal(
+    remapIssueKeyThroughDuplicate("MISSING|node:card|.bindings.fill|variable 'x' is not defined", map),
+    "MISSING|node:card-2|.bindings.fill|variable 'x' is not defined"
+  );
+  // Prefix-sharing: card-title must not become card-2-title
+  assert.equal(
+    remapIssueKeyThroughDuplicate("MISSING|node:card-title|.bindings.fill|node 'card-title' is broken", map),
+    "MISSING|node:card-title-2|.bindings.fill|node 'card-title-2' is broken"
+  );
+  // One-letter id must not corrupt prose
+  assert.equal(
+    remapIssueKeyThroughDuplicate("BAD|node:a|.text|layer has a bad value", map),
+    "BAD|node:a-2|.text|layer has a bad value"
+  );
+  assert.equal(remapDelimitedIds("layer has a bad value", map), "layer has a bad value");
+  assert.equal(remapDelimitedIds("node 'a' and 'card-title' and 'card'", map), "node 'a-2' and 'card-title-2' and 'card-2'");
+
+  // End-to-end: duplicate a node named like a prefix of another without corrupting exemption
+  const document = normalize({
+    canvas: { id: "page", width: 200, height: 100 },
+    nodes: [{ id: "host", type: "FRAME", w: 100, h: 80, children: [
+      { id: "card", type: "RECTANGLE", w: 10, h: 10, fill: "#FF0000", bindings: { fill: "missing-var" } },
+      { id: "card-title", type: "RECTANGLE", w: 10, h: 10, fill: "#00FF00", bindings: { fill: "missing-var" } },
+      { id: "a", type: "RECTANGLE", w: 10, h: 10, fill: "#0000FF", bindings: { fill: "missing-var" } }
+    ] }]
+  });
+  assert.equal(validateDocument(document).length, 3);
+  const ok = validatePatch(document, patchOf(
+    { op: "duplicate", id: "card", idSuffix: "-2" },
+    { op: "duplicate", id: "a", idSuffix: "-2" }
+  ));
+  assert.equal(ok.valid, true, ok.issues.map((i) => i.message).join("; "));
+  assert.equal(validateDocument(ok.document!).length, 5);
+});
+
+
+test("patch set prototype: NAVIGATE, clear [], missing destination, same-patch dest", () => {
+  const document = normalize({
+    canvases: [
+      { id: "home", width: 200, height: 100, nodes: [{ id: "cta", type: "FRAME", w: 40, h: 20 }] },
+      { id: "checkout", width: 200, height: 100, nodes: [] }
+    ]
+  });
+  // Set on nested cta is fine; destination must be top-level (checkout canvas).
+  const nav = applyRaw(document, setOp("cta", {
+    prototype: [{ trigger: { type: "ON_CLICK" }, actions: [{ type: "NAVIGATE", destination: "checkout", transition: { type: "DISSOLVE", easing: "EASE_OUT", duration: 0.3 } }] }]
+  }));
+  const proto = nodeById(nav, "cta").properties.prototype as Array<{ actions: Array<{ destination: string; transition?: { easing?: string } }> }>;
+  assert.equal(proto[0].actions[0].destination, "checkout");
+  assert.equal(proto[0].actions[0].transition?.easing, "EASE_OUT");
+
+  const cleared = applyRaw(nav, setOp("cta", { prototype: [] }));
+  assert.deepEqual(nodeById(cleared, "cta").properties.prototype, []);
+
+  rejects(document, /was not found/, setOp("cta", {
+    prototype: [{ trigger: { type: "ON_CLICK" }, actions: [{ type: "NAVIGATE", destination: "ghost" }] }]
+  }));
+
+  // Same-patch destination from duplicate of a top-level canvas
+  const dup = applyRaw(document,
+    { op: "duplicate", id: "checkout", idSuffix: "-2" },
+    setOp("cta", { prototype: [{ trigger: { type: "ON_CLICK" }, actions: [{ type: "NAVIGATE", destination: "checkout-2" }] }] })
+  );
+  assert.equal((nodeById(dup, "cta").properties.prototype as Array<{ actions: Array<{ destination: string }> }>)[0].actions[0].destination, "checkout-2");
+});
+
+test("patch set prototype: non-top-level NAVIGATE destination is rejected", () => {
+  const document = normalize({
+    canvas: { id: "page", width: 400, height: 200 },
+    nodes: [
+      { id: "cta", type: "FRAME", w: 40, h: 20 },
+      { id: "panel", type: "FRAME", x: 100, w: 40, h: 40 }
+    ]
+  });
+  rejects(document, /must be a top-level frame/, setOp("cta", {
+    prototype: [{ trigger: { type: "ON_CLICK" }, actions: [{ type: "NAVIGATE", destination: "panel" }] }]
+  }));
+});
+
+test("patch set prototype: CHANGE_TO non-COMPONENT and SCROLL_TO across canvases fail", () => {
+  const document = normalize({
+    canvases: [
+      { id: "screen-a", width: 100, height: 80, nodes: [
+        { id: "btn", type: "FRAME", w: 20, h: 10 },
+        { id: "panel", type: "FRAME", w: 40, h: 40 }
+      ] },
+      { id: "screen-b", width: 100, height: 80, nodes: [
+        { id: "other", type: "FRAME", w: 20, h: 10 }
+      ] }
+    ]
+  });
+  rejects(document, /CHANGE_TO destination.*must be a component/, setOp("btn", {
+    prototype: [{ trigger: { type: "ON_CLICK" }, actions: [{ type: "CHANGE_TO", destination: "panel" }] }]
+  }));
+  rejects(document, /SCROLL_TO destination.*same top-level canvas/, setOp("btn", {
+    prototype: [{ trigger: { type: "ON_CLICK" }, actions: [{ type: "SCROLL_TO", destination: "other" }] }]
+  }));
+});
+
+test("patch set prototype: end-of-patch remove of destination fails", () => {
+  const document = normalize({
+    canvases: [
+      { id: "home", width: 200, height: 100, nodes: [
+        { id: "cta", type: "FRAME", w: 40, h: 20, prototype: [{ trigger: { type: "ON_CLICK" }, actions: [{ type: "NAVIGATE", destination: "checkout" }] }] }
+      ] },
+      { id: "checkout", width: 200, height: 100, nodes: [] }
+    ]
+  });
+  rejects(document, /was not found/, { op: "remove", id: "checkout" });
+  rejects(document, /was not found/, setOp("home", { name: "Home" }), { op: "remove", id: "checkout" });
+});
+
+test("patch set prototype: idempotent set → read → set (preserves transition easing)", () => {
+  const document = normalize({
+    canvases: [
+      { id: "a", width: 100, height: 80, nodes: [] },
+      { id: "b", width: 100, height: 80, nodes: [] }
+    ]
+  });
+  const reaction = [{
+    trigger: { type: "ON_CLICK" },
+    actions: [{ type: "NAVIGATE", destination: "b", transition: { type: "SMART_ANIMATE", easing: "GENTLE", duration: 0.45 }, resetScrollPosition: true }]
+  }];
+  const once = applyRaw(document, setOp("a", { prototype: reaction }));
+  const exported = nodeById(once, "a").properties.prototype;
+  const twice = applyRaw(once, setOp("a", { prototype: exported as unknown[] }));
+  assert.deepEqual(nodeById(twice, "a").properties.prototype, exported);
+});
+
+test("patch set prototype: AFTER_TIMEOUT only on top-level; componentId still rejected", () => {
+  const document = normalize({
+    canvases: [
+      { id: "screen", width: 200, height: 100, nodes: [{ id: "child", type: "FRAME", w: 20, h: 10 }] },
+      { id: "next", width: 100, height: 80, nodes: [] }
+    ]
+  });
+  rejects(document, /cannot be patched yet|PATCH_SET_UNSUPPORTED|componentId/, setOp("child", { componentId: "x" }));
+  rejects(document, /AFTER_TIMEOUT.*top-level/, setOp("child", {
+    prototype: [{ trigger: { type: "AFTER_TIMEOUT", timeout: 2 }, actions: [{ type: "NAVIGATE", destination: "next" }] }]
+  }));
+  const ok = applyRaw(document, setOp("screen", {
+    prototype: [{ trigger: { type: "AFTER_TIMEOUT", timeout: 2 }, actions: [{ type: "NAVIGATE", destination: "next" }] }]
+  }));
+  assert.equal((nodeById(ok, "screen").properties.prototype as Array<{ trigger: { type: string } }>)[0].trigger.type, "AFTER_TIMEOUT");
+});
+
+test("patch set prototype: rollback leaves reactions untouched when a later op fails", () => {
+  const document = normalize({
+    canvases: [
+      { id: "screen", width: 200, height: 100, nodes: [] },
+      { id: "next", width: 100, height: 80, nodes: [] }
+    ]
+  });
+  const seeded = applyRaw(document, setOp("screen", {
+    prototype: [{ trigger: { type: "AFTER_TIMEOUT", timeout: 1 }, actions: [{ type: "NAVIGATE", destination: "next" }] }]
+  }));
+  const before = JSON.stringify(nodeById(seeded, "screen").properties.prototype);
+  // validatePatch / applyRaw should reject; document unchanged on throw from applyPatch
+  assert.throws(() => applyPatch(seeded, normalizePatch(patchOf(
+    setOp("screen", { prototype: [{ trigger: { type: "AFTER_TIMEOUT", timeout: 3 }, actions: [{ type: "NAVIGATE", destination: "next" }] }] }),
+    setOp("screen", { text: "nope" })
+  ))), /does not apply|text/);
+  assert.equal(JSON.stringify(nodeById(seeded, "screen").properties.prototype), before);
+});
+
+// --- Patch resource upsert (variables / styles) -----------------------------
+
+test("patch variables/styles: silent-drop repro is now valid and brand resolves", () => {
+  const document = normalize({
+    canvas: { id: "screen", width: 100, height: 100 },
+    nodes: [{ id: "cta", type: "RECTANGLE", w: 40, h: 20, fill: "#ff0000" }]
+  });
+  const patch = {
+    variables: [{ name: "T", items: [{ id: "brand", name: "brand", type: "COLOR", value: { r: 214, g: 92, b: 40, a: 1 } }] }],
+    patch: { operations: [{ op: "set", id: "cta", set: { bindings: { fill: "brand" } } }] }
+  };
+  assert.equal(validate(patch).valid, true);
+  const result = validatePatch(document, patch);
+  assert.equal(result.valid, true, result.issues.map((issue) => `${issue.path}: ${issue.message}`).join("; "));
+  assert.equal(nodeById(result.document!, "cta").properties.bindings?.fill, "brand");
+  assert.ok(result.document!.variables.some((collection) => collection.items.some((item) => item.id === "brand")));
+  assert.ok(result.affectedIds?.includes("variable:T/brand"));
+});
+
+test("patch resource upsert keeps unmentioned modes and value writes only mode 0", () => {
+  const document = normalize({
+    canvas: { id: "screen", width: 100, height: 100 },
+    nodes: [],
+    variables: [{
+      name: "Theme",
+      modes: ["Light", "Dark"],
+      items: [{ id: "brand", name: "color/brand", type: "COLOR", values: { Light: { r: 1, g: 0, b: 0, a: 1 }, Dark: { r: 0, g: 0, b: 1, a: 1 } } }]
+    }]
+  });
+  const keep = applyPatch(document, normalizePatch({
+    variables: [{ name: "Theme", items: [{ id: "brand", name: "color/brand", type: "COLOR", values: { Light: { r: 214, g: 92, b: 40, a: 1 } } }] }],
+    patch: { operations: [{ op: "set", id: "screen", set: { name: "Screen" } }] }
+  }));
+  const brand = keep.document.variables[0].items[0];
+  assert.deepEqual(brand.values?.Light, { r: 214, g: 92, b: 40, a: 1 });
+  assert.deepEqual(brand.values?.Dark, { r: 0, g: 0, b: 1, a: 1 });
+
+  const firstOnly = applyPatch(document, normalizePatch({
+    variables: [{ name: "Theme", items: [{ id: "brand", name: "color/brand", type: "COLOR", value: { r: 9, g: 9, b: 9, a: 1 } }] }],
+    patch: { operations: [{ op: "set", id: "screen", set: { name: "Screen" } }] }
+  }));
+  assert.deepEqual(firstOnly.document.variables[0].items[0].values?.Light, { r: 9, g: 9, b: 9, a: 1 });
+  assert.deepEqual(firstOnly.document.variables[0].items[0].values?.Dark, { r: 0, g: 0, b: 1, a: 1 });
+});
+
+test("patch resource upsert seeds new modes from mode 0 for unmentioned variables", () => {
+  const document = normalize({
+    canvas: { id: "screen", width: 100, height: 100 },
+    nodes: [],
+    variables: [{
+      name: "Theme",
+      modes: ["Light"],
+      items: [
+        { id: "brand", name: "color/brand", type: "COLOR", values: { Light: { r: 1, g: 2, b: 3, a: 1 } } },
+        { id: "ink", name: "color/ink", type: "COLOR", values: { Light: { r: 0, g: 0, b: 0, a: 1 } } }
+      ]
+    }]
+  });
+  const result = applyPatch(document, normalizePatch({
+    variables: [{
+      name: "Theme",
+      modes: ["Light", "Dark"],
+      items: [{ id: "brand", name: "color/brand", type: "COLOR", values: { Dark: { r: 9, g: 9, b: 9, a: 1 } } }]
+    }],
+    patch: { operations: [{ op: "set", id: "screen", set: { name: "Screen" } }] }
+  }));
+  assert.deepEqual(result.document.variables[0].modes, ["Light", "Dark"]);
+  const ink = result.document.variables[0].items.find((item) => item.id === "ink")!;
+  assert.deepEqual(ink.values?.Dark, { r: 0, g: 0, b: 0, a: 1 }, "unmentioned var seeded from mode 0");
+  const brand = result.document.variables[0].items.find((item) => item.id === "brand")!;
+  assert.deepEqual(brand.values?.Dark, { r: 9, g: 9, b: 9, a: 1 });
+  assert.deepEqual(document.variables[0].modes, ["Light"], "input document not mutated");
+});
+
+test("patch resource upsert: unknown mode in values is an error", () => {
+  const document = normalize({
+    canvas: { id: "screen", width: 100, height: 100 },
+    nodes: [],
+    variables: [{ name: "Theme", modes: ["Light"], items: [{ id: "x", name: "x", type: "FLOAT", values: { Light: 1 } }] }]
+  });
+  const result = validatePatch(document, {
+    variables: [{ name: "Theme", items: [{ id: "x", name: "x", type: "FLOAT", values: { Dark: 2 } }] }],
+    patch: { operations: [{ op: "set", id: "screen", set: { name: "Screen" } }] }
+  });
+  assert.equal(result.valid, false);
+  assert.equal(result.issues[0].code, "PATCH_RESOURCE_INVALID");
+  assert.match(result.issues[0].message, /mode 'Dark'/);
+});
+
+test("patch resource upsert: type conflict and id/name mismatch", () => {
+  const document = normalize({
+    canvas: { id: "screen", width: 100, height: 100 },
+    nodes: [],
+    variables: [{ name: "Theme", modes: ["Light"], items: [{ id: "brand", name: "color/brand", type: "COLOR", values: { Light: { r: 1, g: 1, b: 1, a: 1 } } }] }],
+    styles: [{ id: "ink", name: "Ink", type: "PAINT", paints: ["#111111"] }]
+  });
+  const typeClash = validatePatch(document, {
+    variables: [{ name: "Theme", items: [{ name: "color/brand", type: "FLOAT", value: 1 }] }],
+    patch: { operations: [{ op: "set", id: "screen", set: { name: "Screen" } }] }
+  });
+  assert.equal(typeClash.valid, false);
+  assert.equal(typeClash.issues[0].code, "PATCH_RESOURCE_CONFLICT");
+
+  const rename = validatePatch(document, {
+    variables: [{ name: "Theme", items: [{ id: "brand", name: "color/other", type: "COLOR", value: { r: 1, g: 0, b: 0, a: 1 } }] }],
+    patch: { operations: [{ op: "set", id: "screen", set: { name: "Screen" } }] }
+  });
+  assert.equal(rename.valid, false);
+  assert.equal(rename.issues[0].code, "PATCH_RESOURCE_CONFLICT");
+  assert.match(rename.issues[0].message, /cannot rename/);
+
+  const styleType = validatePatch(document, {
+    styles: [{ id: "ink", name: "Ink", type: "TEXT", font: { family: "Inter", style: "Bold", size: 20 } }],
+    patch: { operations: [{ op: "set", id: "screen", set: { name: "Screen" } }] }
+  });
+  assert.equal(styleType.valid, false);
+  assert.equal(styleType.issues[0].code, "PATCH_RESOURCE_CONFLICT");
+});
+
+test("patch resource upsert: TEXT font merge and PAINT replace; style match by id then name", () => {
+  const document = normalize({
+    canvas: { id: "screen", width: 100, height: 100 },
+    nodes: [],
+    styles: [
+      { id: "heading", name: "Heading", type: "TEXT", font: { family: "Inter", style: "Bold", size: 32 } },
+      { id: "ink", name: "Ink", type: "PAINT", paints: ["#111111"] }
+    ]
+  });
+  const merged = applyPatch(document, normalizePatch({
+    styles: [{ id: "heading", name: "Heading", type: "TEXT", font: { size: 44 } }],
+    patch: { operations: [{ op: "set", id: "screen", set: { name: "Screen" } }] }
+  }));
+  assert.deepEqual(merged.document.styles.find((style) => style.id === "heading")?.font, { family: "Inter", style: "Bold", size: 44 });
+
+  const byName = applyPatch(document, normalizePatch({
+    styles: [{ name: "Ink", type: "PAINT", paints: ["#FF0000"] }],
+    patch: { operations: [{ op: "set", id: "screen", set: { name: "Screen" } }] }
+  }));
+  assert.equal(byName.document.styles.find((style) => style.name === "Ink")?.paints?.[0].type, "SOLID");
+
+  // Match by id when name differs would be a conflict; match by id with same name:
+  const byId = applyPatch(document, normalizePatch({
+    styles: [{ id: "heading", name: "Heading", type: "TEXT", font: { style: "Medium" } }],
+    patch: { operations: [{ op: "set", id: "screen", set: { name: "Screen" } }] }
+  }));
+  assert.equal(byId.document.styles.find((style) => style.id === "heading")?.font?.style, "Medium");
+  assert.equal(byId.document.styles.find((style) => style.id === "heading")?.font?.family, "Inter");
+});
+
+test("patch resource upsert: later op binds new token; without upsert still fails; incomplete values; schema rejects nodes", () => {
+  const document = normalize({
+    canvas: { id: "screen", width: 100, height: 100 },
+    nodes: [{ id: "cta", type: "RECTANGLE", w: 40, h: 20, fill: "#ff0000" }]
+  });
+  const withToken = validatePatch(document, {
+    variables: [{ name: "T", modes: ["Light"], items: [{ id: "brand", name: "brand", type: "COLOR", values: { Light: { r: 1, g: 0, b: 0, a: 1 } } }] }],
+    patch: { operations: [{ op: "set", id: "cta", set: { bindings: { fill: "brand" } } }] }
+  });
+  assert.equal(withToken.valid, true);
+
+  const without = validatePatch(document, {
+    patch: { operations: [{ op: "set", id: "cta", set: { bindings: { fill: "brand" } } }] }
+  });
+  assert.equal(without.valid, false);
+  assert.match(without.issues.map((issue) => issue.message).join("\n"), /variable 'brand' is not defined/);
+
+  const incomplete = validatePatch(document, {
+    variables: [{ name: "Theme", modes: ["Light", "Dark"], items: [{ id: "x", name: "x", type: "FLOAT", values: { Light: 1 } }] }],
+    patch: { operations: [{ op: "set", id: "screen", set: { name: "Screen" } }] }
+  });
+  assert.equal(incomplete.valid, false);
+  assert.equal(incomplete.issues[0].code, "PATCH_RESOURCE_INVALID");
+  assert.match(incomplete.issues[0].message, /missing values for mode.*Dark/);
+
+  const nodesReject = validate({
+    patch: { operations: [{ op: "set", id: "cta", set: { name: "x" } }] },
+    nodes: [{ id: "ghost", type: "RECTANGLE", w: 1, h: 1 }]
+  });
+  assert.equal(nodesReject.valid, false);
+});
+
+test("patch resource upsert: modes[0] is never renamed on an existing collection", () => {
+  const document = normalize({
+    canvas: { id: "screen", width: 100, height: 100 },
+    nodes: [],
+    variables: [{ name: "Theme", modes: ["Light"], items: [{ id: "x", name: "x", type: "FLOAT", values: { Light: 1 } }] }]
+  });
+  const result = applyPatch(document, normalizePatch({
+    variables: [{ name: "Theme", modes: ["Dark", "Night"], items: [{ id: "x", name: "x", type: "FLOAT", values: { Dark: 2, Night: 3 } }] }],
+    patch: { operations: [{ op: "set", id: "screen", set: { name: "Screen" } }] }
+  }));
+  assert.deepEqual(result.document.variables[0].modes, ["Light", "Dark", "Night"]);
+  assert.equal(result.document.variables[0].items[0].values?.Light, 1);
+  assert.equal(result.document.variables[0].items[0].values?.Dark, 2);
+});
+
+test("patch resource upsert: shared matchStyle/matchVariable prefer id over name", () => {
+  const styles = [
+    { id: "a", name: "Alpha", type: "PAINT" as const, paints: [] },
+    { id: "b", name: "Beta", type: "PAINT" as const, paints: [] }
+  ];
+  assert.equal(matchStyle(styles, { id: "b", name: "Alpha" })?.by, "id");
+  assert.equal(matchStyle(styles, { id: "b", name: "Alpha" })?.style.name, "Beta");
+  assert.equal(matchStyle(styles, { name: "Alpha" })?.by, "name");
+
+  const items = [
+    { id: "v1", name: "gap", type: "FLOAT" as const, value: 8 },
+    { id: "v2", name: "radius", type: "FLOAT" as const, value: 4 }
+  ];
+  assert.equal(matchVariable(items, { id: "v2", name: "gap" })?.by, "id");
+  assert.equal(matchVariable(items, { name: "gap" })?.by, "name");
+});
+
+test("patch resource upsert: pre-existing token issue does not block", () => {
+  const document = normalize({
+    canvas: { id: "screen", width: 100, height: 100 },
+    nodes: [
+      { id: "ok", type: "RECTANGLE", w: 10, h: 10, fill: "#fff" },
+      { id: "broken", type: "RECTANGLE", w: 10, h: 10, fill: "#fff", bindings: { fill: "missing-preexisting" } }
+    ],
+    variables: [{ name: "Theme", modes: ["Light"], items: [{ id: "brand", name: "brand", type: "COLOR", values: { Light: { r: 1, g: 0, b: 0, a: 1 } } }] }]
+  });
+  const result = validatePatch(document, {
+    variables: [{ name: "Theme", items: [{ id: "brand", name: "brand", type: "COLOR", values: { Light: { r: 0, g: 1, b: 0, a: 1 } } }] }],
+    patch: { operations: [{ op: "set", id: "ok", set: { bindings: { fill: "brand" } } }] }
+  });
+  assert.equal(result.valid, true, result.issues.map((issue) => issue.message).join("; "));
+});
+
+test("Gate #45.1: token-only patch with empty operations is valid", () => {
+  const document = normalize({
+    canvas: { id: "screen", width: 100, height: 100 },
+    nodes: [{ id: "cta", type: "RECTANGLE", w: 10, h: 10, fill: "#ff0000" }],
+    variables: [{ name: "Theme", modes: ["Light"], items: [{ id: "brand", name: "color/brand", type: "COLOR", values: { Light: { r: 1, g: 0, b: 0, a: 1 } } }] }]
+  });
+  const patch = {
+    variables: [{ name: "Theme", items: [{ id: "brand", name: "color/brand", type: "COLOR", values: { Light: { r: 0.2, g: 0.3, b: 0.4, a: 1 } } }] }],
+    patch: { operations: [] }
+  };
+  assert.equal(validate(patch).valid, true, validate(patch).issues.map((issue) => issue.message).join("; "));
+  const result = validatePatch(document, patch);
+  assert.equal(result.valid, true, result.issues.map((issue) => issue.message).join("; "));
+  assert.deepEqual(result.document!.variables[0].items[0].values?.Light, { r: 0.2, g: 0.3, b: 0.4, a: 1 });
+
+  const empty = validate({ patch: { operations: [] } });
+  assert.equal(empty.valid, false, "fully empty patch still rejected");
+});
+
+test("Gate #45.2: name match with different id is PATCH_RESOURCE_CONFLICT (styles + variables)", () => {
+  const document = normalize({
+    canvas: { id: "screen", width: 100, height: 100 },
+    nodes: [],
+    variables: [{ name: "Theme", modes: ["Light"], items: [{ id: "brand", name: "color/brand", type: "COLOR", values: { Light: { r: 1, g: 0, b: 0, a: 1 } } }] }],
+    styles: [{ id: "heading", name: "Heading", type: "TEXT", font: { family: "Inter", style: "Bold", size: 32 } }]
+  });
+  const styleClash = validatePatch(document, {
+    styles: [{ id: "h2", name: "Heading", type: "TEXT", font: { size: 44 } }],
+    patch: { operations: [{ op: "set", id: "screen", set: { name: "Screen" } }] }
+  });
+  assert.equal(styleClash.valid, false);
+  assert.equal(styleClash.issues[0].code, "PATCH_RESOURCE_CONFLICT");
+  assert.match(styleClash.issues[0].message, /already has id 'heading'/);
+
+  const varClash = validatePatch(document, {
+    variables: [{ name: "Theme", items: [{ id: "brand2", name: "color/brand", type: "COLOR", value: { r: 0, g: 1, b: 0, a: 1 } }] }],
+    patch: { operations: [{ op: "set", id: "screen", set: { name: "Screen" } }] }
+  });
+  assert.equal(varClash.valid, false);
+  assert.equal(varClash.issues[0].code, "PATCH_RESOURCE_CONFLICT");
+  assert.match(varClash.issues[0].message, /already has id 'brand'/);
+});
+
+test("Gate #45.3: variable and style ids must be unique across collections", () => {
+  const document = normalize({
+    canvas: { id: "screen", width: 100, height: 100 },
+    nodes: [],
+    variables: [{ name: "Theme", modes: ["Light"], items: [{ id: "brand", name: "color/brand", type: "COLOR", values: { Light: { r: 1, g: 0, b: 0, a: 1 } } }] }],
+    styles: [{ id: "ink", name: "Ink", type: "PAINT", paints: ["#111"] }]
+  });
+  const dupVar = validatePatch(document, {
+    variables: [{ name: "Other", modes: ["Light"], items: [{ id: "brand", name: "other/brand", type: "COLOR", values: { Light: { r: 0, g: 1, b: 0, a: 1 } } }] }],
+    patch: { operations: [] }
+  });
+  assert.equal(dupVar.valid, false);
+  assert.equal(dupVar.issues[0].code, "PATCH_RESOURCE_CONFLICT");
+  assert.match(dupVar.issues[0].message, /already used by 'Theme\/color\/brand'/);
+
+  // Style ids: matching by id with a different name is also CONFLICT (no rename / no second style with that id).
+  const dupStyle = validatePatch(document, {
+    styles: [{ id: "ink", name: "InkAlt", type: "PAINT", paints: ["#222222"] }],
+    patch: { operations: [] }
+  });
+  assert.equal(dupStyle.valid, false);
+  assert.equal(dupStyle.issues[0].code, "PATCH_RESOURCE_CONFLICT");
+  assert.match(dupStyle.issues[0].message, /already bound to name 'Ink'|already used by 'Ink'/);
+});
+
+test("Gate #45.4: new variable missing a mode value fails in the shared plan", () => {
+  const document = normalize({
+    canvas: { id: "screen", width: 100, height: 100 },
+    nodes: [],
+    variables: [{ name: "Theme", modes: ["Light", "Dark"], items: [] }]
+  });
+  // Empty items on existing collection — patch creates incomplete variable
+  const result = validatePatch(document, {
+    variables: [{ name: "Theme", items: [{ id: "gap", name: "gap", type: "FLOAT", values: { Light: 8 } }] }],
+    patch: { operations: [] }
+  });
+  assert.equal(result.valid, false);
+  assert.equal(result.issues[0].code, "PATCH_RESOURCE_INVALID");
+  assert.match(result.issues[0].message, /missing values for mode.*Dark/);
+  // Input document unchanged
+  assert.equal(document.variables[0].items.length, 0);
+});
+
+
+// --- wrap / unwrap -----------------------------------------------------------
+
+test("wrap: free-positioned siblings keep absolute coords; wrapper at bbox", () => {
+  const document = normalize({
+    canvas: { id: "screen", width: 400, height: 400 },
+    nodes: [
+      { id: "icon", type: "RECTANGLE", x: 24, y: 100, w: 40, h: 40, fill: "#f00" },
+      { id: "title", type: "RECTANGLE", x: 24, y: 160, w: 80, h: 24, fill: "#0f0" }
+    ]
+  });
+  const result = applyRaw(document, {
+    op: "wrap",
+    ids: ["icon", "title"],
+    node: { id: "row", type: "FRAME" }
+  });
+  const row = nodeById(result, "row");
+  assert.deepEqual(row.properties.position, { x: 24, y: 100 });
+  assert.deepEqual(row.properties.size, { width: 80, height: 84 });
+  assert.deepEqual(row.children.map((c) => c.id), ["icon", "title"]);
+  assert.deepEqual(nodeById(result, "icon").properties.position, { x: 24, y: 100 });
+  assert.deepEqual(nodeById(result, "title").properties.position, { x: 24, y: 160 });
+  assert.equal(findNode(result, "icon")!.properties.position.x - row.properties.position.x, 0);
+});
+
+test("wrap: Auto Layout wrapper + omitted vs authored size", () => {
+  const document = normalize({
+    canvas: { id: "screen", width: 400, height: 400 },
+    nodes: [
+      { id: "a", type: "RECTANGLE", x: 10, y: 20, w: 30, h: 30 },
+      { id: "b", type: "RECTANGLE", x: 50, y: 20, w: 30, h: 30 }
+    ]
+  });
+  const hugged = applyRaw(document, {
+    op: "wrap", ids: ["a", "b"],
+    node: { id: "row", type: "FRAME", layout: { direction: "HORIZONTAL", itemSpacing: 8, primaryAxisSizingMode: "HUG", counterAxisSizingMode: "HUG" } }
+  });
+  assert.equal(nodeById(hugged, "row").properties.layout?.direction, "HORIZONTAL");
+  assert.deepEqual(nodeById(hugged, "row").properties.size, { width: 70, height: 30 });
+
+  const sized = applyRaw(document, {
+    op: "wrap", ids: ["a", "b"],
+    node: { id: "box", type: "FRAME", w: 200, h: 100 }
+  });
+  assert.deepEqual(nodeById(sized, "box").properties.size, { width: 200, height: 100 });
+});
+
+test("wrap under AL parent: wrapper takes first listed child's slot; ABSOLUTE child and sibling", () => {
+  const document = normalize({
+    canvas: { id: "screen", width: 400, height: 400 },
+    nodes: [{
+      id: "stack", type: "FRAME", x: 0, y: 0, w: 300, h: 300,
+      layout: { direction: "VERTICAL", itemSpacing: 8 },
+      children: [
+        { id: "keep", type: "RECTANGLE", x: 0, y: 0, w: 40, h: 20, fill: "#111" },
+        { id: "icon", type: "RECTANGLE", x: 0, y: 28, w: 40, h: 40, fill: "#f00" },
+        { id: "badge", type: "RECTANGLE", x: 200, y: 10, w: 16, h: 16, fill: "#00f", layoutPositioning: "ABSOLUTE" },
+        { id: "title", type: "RECTANGLE", x: 0, y: 76, w: 80, h: 24, fill: "#0f0" }
+      ]
+    }]
+  });
+  // Wrap icon+title (non-ABSOLUTE); badge is ABSOLUTE sibling left outside.
+  const wrapped = applyRaw(document, {
+    op: "wrap", ids: ["icon", "title"],
+    node: { id: "row", type: "FRAME", layout: { direction: "HORIZONTAL", itemSpacing: 4 } }
+  });
+  const stack = nodeById(wrapped, "stack");
+  assert.deepEqual(stack.children.map((c) => c.id), ["keep", "row", "badge"]);
+  assert.equal(nodeById(wrapped, "badge").properties.layoutPositioning, "ABSOLUTE");
+  assert.deepEqual(nodeById(wrapped, "badge").properties.position, { x: 200, y: 10 });
+  assert.deepEqual(nodeById(wrapped, "row").children.map((c) => c.id), ["icon", "title"]);
+
+  // Separate: wrap including an ABSOLUTE child — it keeps layoutPositioning + absolute coords.
+  const withAbs = applyRaw(document, {
+    op: "wrap", ids: ["icon", "badge"],
+    node: { id: "chrome", type: "FRAME" }
+  });
+  const chrome = nodeById(withAbs, "chrome");
+  assert.equal(nodeById(withAbs, "badge").properties.layoutPositioning, "ABSOLUTE");
+  assert.deepEqual(nodeById(withAbs, "badge").properties.position, { x: 200, y: 10 });
+  assert.equal(chrome.children.map((c) => c.id).includes("badge"), true);
+  // Wrapper sits at first listed child's pre-removal slot (icon was after keep).
+  assert.equal(nodeById(withAbs, "stack").children[1].id, "chrome");
+});
+
+test("unwrap: FRAME/GROUP promote children with absolutes; AL parent + ABSOLUTE; visual WARNING", () => {
+  const document = normalize({
+    canvas: { id: "screen", width: 400, height: 400 },
+    nodes: [{
+      id: "stack", type: "FRAME", x: 0, y: 0, w: 300, h: 300,
+      layout: { direction: "VERTICAL", itemSpacing: 8 },
+      children: [
+        { id: "keep", type: "RECTANGLE", x: 0, y: 0, w: 40, h: 20 },
+        {
+          id: "row", type: "FRAME", x: 0, y: 28, w: 120, h: 50,
+          fill: "#abcdef", stroke: "#000", effects: [{ type: "DROP_SHADOW", color: "#00000040", offset: { x: 0, y: 2 }, blur: 4 }],
+          clipsContent: true,
+          children: [
+            { id: "icon", type: "RECTANGLE", x: 0, y: 0, w: 40, h: 40 },
+            { id: "pin", type: "RECTANGLE", x: 90, y: -23, w: 10, h: 10, layoutPositioning: "ABSOLUTE" }
+          ]
+        }
+      ]
+    }]
+  });
+  const patch = normalizePatch({ patch: { operations: [{ op: "unwrap", id: "row" }] } });
+  const result = applyPatch(document, patch);
+  assert.equal(findNode(result.document, "row"), null);
+  const stack = nodeById(result.document, "stack");
+  assert.deepEqual(stack.children.map((c) => c.id), ["keep", "icon", "pin"]);
+  assert.deepEqual(nodeById(result.document, "icon").properties.position, { x: 0, y: 28 });
+  assert.equal(nodeById(result.document, "pin").properties.layoutPositioning, "ABSOLUTE");
+  assert.deepEqual(nodeById(result.document, "pin").properties.position, { x: 90, y: 5 });
+  assert.ok(result.warnings.some((w) => /unwrap 'row': dropped wrapper/.test(w) && /fills/.test(w) && /strokes/.test(w) && /effects/.test(w) && /clipsContent/.test(w)));
+
+  // GROUP unwrap
+  const grouped = normalize({
+    canvas: { id: "screen", width: 200, height: 200 },
+    nodes: [{
+      id: "g", type: "GROUP", x: 10, y: 10, w: 50, h: 50,
+      children: [
+        { id: "r1", type: "RECTANGLE", x: 10, y: 10, w: 20, h: 20 },
+        { id: "r2", type: "RECTANGLE", x: 40, y: 40, w: 20, h: 20 }
+      ]
+    }]
+  });
+  const ungrouped = applyRaw(grouped, { op: "unwrap", id: "g" });
+  assert.equal(findNode(ungrouped, "g"), null);
+  // Authored (10,10) under group at (10,10) → absolute (20,20); unwrap preserves absolute.
+  assert.deepEqual(nodeById(ungrouped, "r1").properties.position, { x: 20, y: 20 });
+});
+
+test("wrap/unwrap errors: non-siblings, collision, GROUP type, COMPONENT unwrap, rotation", () => {
+  const document = normalize({
+    canvas: { id: "screen", width: 200, height: 200 },
+    nodes: [
+      { id: "a", type: "RECTANGLE", x: 0, y: 0, w: 10, h: 10 },
+      { id: "nest", type: "FRAME", x: 20, y: 0, w: 50, h: 50, children: [
+        { id: "b", type: "RECTANGLE", x: 20, y: 0, w: 10, h: 10 }
+      ] },
+      { id: "button", type: "COMPONENT", x: 100, y: 0, w: 40, h: 40, children: [{ id: "lab", type: "RECTANGLE", w: 10, h: 10 }] },
+      { id: "spin", type: "RECTANGLE", x: 0, y: 100, w: 10, h: 10, rotation: 15 }
+    ]
+  });
+  rejects(document, /same parent/, { op: "wrap", ids: ["a", "b"], node: { id: "row", type: "FRAME" } });
+  rejects(document, /already exists/, { op: "wrap", ids: ["a"], node: { id: "nest", type: "FRAME" } });
+  // Schema wrapNode.type is const FRAME — rejected at validate before normalize's message.
+  rejects(document, /must be equal to constant|must be FRAME/, { op: "wrap", ids: ["a"], node: { id: "g", type: "GROUP" } });
+  rejects(document, /cannot unwrap COMPONENT/, { op: "unwrap", id: "button" });
+  rejects(document, /rotated/, { op: "wrap", ids: ["spin"], node: { id: "box", type: "FRAME" } });
+  rejects(document, /was not found/, { op: "wrap", ids: ["ghost"], node: { id: "box", type: "FRAME" } });
+});
+
+test("unwrap GROUP at (40,60): children keep absolute (no group-origin shift)", () => {
+  const document = normalize({
+    canvas: { id: "screen", width: 400, height: 400 },
+    nodes: [{
+      id: "holder", type: "FRAME", x: 0, y: 0, w: 400, h: 400,
+      children: [{
+        id: "g", type: "GROUP", x: 40, y: 60, w: 60, h: 60,
+        children: [
+          { id: "a", type: "RECTANGLE", x: 0, y: 0, w: 20, h: 20, fill: "#f00" },
+          { id: "b", type: "RECTANGLE", x: 40, y: 40, w: 20, h: 20, fill: "#0f0" }
+        ]
+      }]
+    }]
+  });
+  assert.deepEqual(nodeById(document, "a").properties.position, { x: 40, y: 60 });
+  assert.deepEqual(nodeById(document, "b").properties.position, { x: 80, y: 100 });
+  const result = applyRaw(document, { op: "unwrap", id: "g" });
+  assert.equal(findNode(result, "g"), null);
+  assert.deepEqual(nodeById(result, "a").properties.position, { x: 40, y: 60 });
+  assert.deepEqual(nodeById(result, "b").properties.position, { x: 80, y: 100 });
+  const holder = nodeById(result, "holder");
+  assert.deepEqual(holder.children.map((c) => c.id).sort(), ["a", "b"]);
+});
+
+test("unwrap rejects rotated wrapper (same rule as wrap)", () => {
+  const document = normalize({
+    canvas: { id: "screen", width: 200, height: 200 },
+    nodes: [{
+      id: "spin", type: "FRAME", x: 10, y: 10, w: 80, h: 80, rotation: 15,
+      children: [{ id: "leaf", type: "RECTANGLE", x: 0, y: 0, w: 20, h: 20 }]
+    }]
+  });
+  rejects(document, /unwrap does not support rotated/, { op: "unwrap", id: "spin" });
+});
+
+test("wrap of top-level NAVIGATE destination fails end-of-patch #42 check", () => {
+  const document = normalize({
+    canvases: [
+      { id: "home", width: 200, height: 100, nodes: [
+        { id: "cta", type: "FRAME", w: 40, h: 20, prototype: [{ trigger: { type: "ON_CLICK" }, actions: [{ type: "NAVIGATE", destination: "checkout" }] }] }
+      ] },
+      { id: "checkout", width: 200, height: 100, nodes: [] }
+    ]
+  });
+  // Wrapping checkout (top-level NAVIGATE dest) under a new frame with home makes it nested.
+  rejects(document, /must be a top-level frame|NAVIGATE/, {
+    op: "wrap", ids: ["home", "checkout"],
+    node: { id: "shell", type: "FRAME" }
+  });
+});
+
+test("unwrap of top-level frame breaks SCROLL_TO canvas rule at end-of-patch", () => {
+  const document = normalize({
+    canvas: { id: "screen", width: 300, height: 200 },
+    nodes: [
+      { id: "btn", type: "FRAME", x: 0, y: 0, w: 40, h: 20, prototype: [{ trigger: { type: "ON_CLICK" }, actions: [{ type: "SCROLL_TO", destination: "panel" }] }] },
+      { id: "panel", type: "FRAME", x: 0, y: 40, w: 100, h: 80 }
+    ]
+  });
+  // screen is the canvas root; unwrap promotes btn+panel to separate roots → different canvases.
+  rejects(document, /SCROLL_TO destination.*same top-level canvas/, { op: "unwrap", id: "screen" });
+});
+
+test("unwrap fails eagerly when an outside prototype still targets the wrapper", () => {
+  const document = normalize({
+    canvas: { id: "page", width: 400, height: 200 },
+    nodes: [
+      { id: "cta", type: "FRAME", w: 40, h: 20, prototype: [{ trigger: { type: "ON_CLICK" }, actions: [{ type: "NAVIGATE", destination: "checkout" }] }] },
+      { id: "checkout", type: "FRAME", x: 100, w: 80, h: 80, children: [{ id: "inner", type: "RECTANGLE", w: 10, h: 10 }] },
+      { id: "other", type: "FRAME", x: 200, w: 80, h: 80 }
+    ]
+  });
+  // checkout is nested (not top-level) — pre-existing NAVIGATE is import-lenient / exempt.
+  // But unwrap still eagerly fails because cta targets checkout.
+  rejects(document, /still targets it/, { op: "unwrap", id: "checkout" });
+});
+
+test("wrap then failing later op rolls back (core is pure — document unchanged)", () => {
+  const document = normalize({
+    canvas: { id: "screen", width: 200, height: 200 },
+    nodes: [
+      { id: "a", type: "RECTANGLE", x: 10, y: 10, w: 20, h: 20 },
+      { id: "b", type: "RECTANGLE", x: 40, y: 10, w: 20, h: 20 }
+    ]
+  });
+  const before = JSON.stringify(document);
+  rejects(document, /was not found/, {
+    op: "wrap", ids: ["a", "b"], node: { id: "row", type: "FRAME" }
+  }, { op: "set", id: "ghost", set: { name: "nope" } });
+  assert.equal(JSON.stringify(document), before);
+});
+
+// --- componentize -----------------------------------------------------------
+
+const cardTree = (id: string, x: number, extras: Record<string, unknown> = {}) => ({
+  id, type: "FRAME", name: `Card ${id}`, x, y: 0, w: 120, h: 80, fill: "#FFFFFF",
+  children: [
+    { id: `${id}-title`, type: "TEXT", name: "Title", x: 8, y: 8, w: 100, h: 24, text: "Hello", font: { family: "Inter", style: "Bold", size: 16 }, fills: [] },
+    { id: `${id}-badge`, type: "RECTANGLE", name: "Badge", x: 8, y: 40, w: 20, h: 20, fill: "#00FF00", ...(extras.badge || {}) }
+  ],
+  ...Object.fromEntries(Object.entries(extras).filter(([k]) => k !== "badge"))
+});
+
+test("componentize promote-only: FRAME becomes COMPONENT, same id", () => {
+  const document = normalize({
+    canvas: { id: "page", width: 400, height: 200 },
+    nodes: [cardTree("card", 0)]
+  });
+  const after = applyRaw(document, { op: "componentize", id: "card" });
+  assert.equal(nodeById(after, "card").type, "COMPONENT");
+  assert.equal(nodeById(after, "card-title").type, "TEXT");
+  assert.deepEqual(nodeById(after, "card").properties.position, nodeById(document, "card").properties.position);
+});
+
+test("componentize with properties and instances: TEXT/BOOLEAN overrides", () => {
+  const document = normalize({
+    canvas: { id: "page", width: 600, height: 200 },
+    nodes: [
+      cardTree("a", 0),
+      {
+        id: "b", type: "FRAME", name: "Card b", x: 140, y: 0, w: 120, h: 80, fill: "#FFFFFF",
+        children: [
+          { id: "b-title", type: "TEXT", name: "Title", x: 8, y: 8, w: 100, h: 24, text: "Other", font: { family: "Inter", style: "Bold", size: 16 }, fills: [] },
+          { id: "b-badge", type: "RECTANGLE", name: "Badge", x: 8, y: 40, w: 20, h: 20, fill: "#00FF00", visible: false }
+        ]
+      },
+      cardTree("c", 280)
+    ]
+  });
+  const after = applyRaw(document, {
+    op: "componentize", id: "a",
+    properties: {
+      Title: { type: "TEXT", layer: "a-title" },
+      ShowBadge: { type: "BOOLEAN", layer: "a-badge" }
+    },
+    instances: ["b", "c"]
+  });
+  assert.equal(nodeById(after, "a").type, "COMPONENT");
+  assert.equal(nodeById(after, "b").type, "INSTANCE");
+  assert.equal(nodeById(after, "c").type, "INSTANCE");
+  assert.equal(nodeById(after, "b").properties.componentId, "a");
+  assert.equal(nodeById(after, "c").properties.componentId, "a");
+  assert.deepEqual(nodeById(after, "b").properties.instanceProperties, { Title: "Other", ShowBadge: false });
+  assert.equal(nodeById(after, "c").properties.instanceProperties, undefined);
+  assert.equal(nodeById(after, "b").children.length, 0);
+  assert.ok(nodeById(after, "a").properties.componentProperties?.some((p) => p.name === "Title" && p.type === "TEXT"));
+  assert.equal(nodeById(after, "a-title").properties.componentPropertyReferences?.characters, "Title");
+  assert.equal(nodeById(after, "a-badge").properties.componentPropertyReferences?.visible, "ShowBadge");
+});
+
+test("componentize rejects size mismatch (Gate: copy w/h must equal source)", () => {
+  const document = normalize({
+    canvas: { id: "page", width: 400, height: 200 },
+    nodes: [
+      cardTree("a", 0),
+      { id: "b", type: "FRAME", x: 140, y: 0, w: 120, h: 90, fill: "#FFFFFF", children: [
+        { id: "b-title", type: "TEXT", name: "Title", x: 8, y: 8, w: 100, h: 24, text: "Hello", font: { family: "Inter", style: "Bold", size: 16 }, fills: [] },
+        { id: "b-badge", type: "RECTANGLE", name: "Badge", x: 8, y: 40, w: 20, h: 20, fill: "#00FF00" }
+      ] }
+    ]
+  });
+  rejects(document, /differs at size/, { op: "componentize", id: "a", instances: ["b"] });
+});
+
+test("componentize rejects bindings-only mismatch in both engines contract", () => {
+  const document = normalize({
+    canvas: { id: "page", width: 400, height: 200 },
+    variables: [{ name: "Tokens", modes: ["Default"], items: [{ id: "gap", name: "gap", type: "FLOAT", values: { Default: 8 } }] }],
+    nodes: [
+      { id: "a", type: "FRAME", name: "A", x: 0, y: 0, w: 80, h: 40, fill: "#FFFFFF", children: [
+        { id: "a-leaf", type: "RECTANGLE", name: "Leaf", x: 4, y: 4, w: 20, h: 20, fill: "#111111", bindings: { opacity: "gap" } }
+      ] },
+      { id: "b", type: "FRAME", name: "B", x: 100, y: 0, w: 80, h: 40, fill: "#FFFFFF", children: [
+        { id: "b-leaf", type: "RECTANGLE", name: "Leaf", x: 4, y: 4, w: 20, h: 20, fill: "#111111" }
+      ] }
+    ]
+  });
+  rejects(document, /differs at children\[0\]\.bindings/, { op: "componentize", id: "a", instances: ["b"] });
+});
+
+test("componentize then set on source in same patch (id stability)", () => {
+  const document = normalize({
+    canvas: { id: "page", width: 400, height: 200 },
+    nodes: [cardTree("card", 0)]
+  });
+  const after = applyRaw(document,
+    { op: "componentize", id: "card" },
+    { op: "set", id: "card", set: { name: "CardMaster" } }
+  );
+  assert.equal(nodeById(after, "card").type, "COMPONENT");
+  assert.equal(nodeById(after, "card").name, "CardMaster");
+});
+
+test("componentize rejects non-FRAME, nested COMPONENT, rotation", () => {
+  const base = normalize({
+    canvas: { id: "page", width: 400, height: 200 },
+    nodes: [
+      { id: "rect", type: "RECTANGLE", w: 10, h: 10 },
+      { id: "host", type: "COMPONENT", w: 40, h: 40, children: [
+        { id: "inner", type: "FRAME", w: 20, h: 20 }
+      ] },
+      { id: "spin", type: "FRAME", w: 40, h: 40, rotation: 10, children: [
+        { id: "spin-leaf", type: "RECTANGLE", w: 10, h: 10 }
+      ] }
+    ]
+  });
+  rejects(base, /only accepts FRAME/, { op: "componentize", id: "rect" });
+  rejects(base, /inside a COMPONENT/, { op: "componentize", id: "inner" });
+  rejects(base, /rotated/, { op: "componentize", id: "spin" });
+});
+
+test("componentize under AL parent keeps slot; promote-only then duplicate", () => {
+  const document = normalize({
+    canvas: { id: "page", width: 400, height: 200 },
+    nodes: [{
+      id: "row", type: "FRAME", w: 300, h: 100,
+      layout: { direction: "HORIZONTAL", itemSpacing: 8 },
+      children: [
+        { id: "card", type: "FRAME", w: 80, h: 40, fill: "#EEE", children: [
+          { id: "card-t", type: "TEXT", w: 60, h: 20, text: "Hi", font: { family: "Inter", style: "Regular", size: 12 }, fills: [] }
+        ] },
+        { id: "spacer", type: "RECTANGLE", w: 10, h: 10, fill: "#000" }
+      ]
+    }]
+  });
+  const after = applyRaw(document, {
+    op: "componentize", id: "card", properties: { Title: { type: "TEXT", layer: "card-t" } }
+  });
+  assert.equal(nodeById(after, "card").type, "COMPONENT");
+  assert.deepEqual(nodeById(after, "row").children.map((c) => c.id), ["card", "spacer"]);
+  assert.equal(nodeById(after, "card-t").properties.componentPropertyReferences?.characters, "Title");
+});
+
+test("componentize strict diff rejects hangingPunctuation-only and hangingList-only copies", () => {
+  const base = {
+    canvas: { id: "page", width: 400, height: 200 },
+    nodes: [
+      { id: "a", type: "FRAME", name: "Card", x: 0, y: 0, w: 80, h: 40, fill: "#FFFFFF", children: [
+        { id: "a-t", type: "TEXT", name: "Title", x: 4, y: 4, w: 60, h: 20, text: "Hi", font: { family: "Inter", style: "Regular", size: 12 }, fills: [] }
+      ] },
+      { id: "b", type: "FRAME", name: "Card", x: 100, y: 0, w: 80, h: 40, fill: "#FFFFFF", children: [
+        { id: "b-t", type: "TEXT", name: "Title", x: 4, y: 4, w: 60, h: 20, text: "Hi", font: { family: "Inter", style: "Regular", size: 12 }, fills: [], hangingPunctuation: true }
+      ] }
+    ]
+  };
+  rejects(normalize(base), /differs at children\[0\]\.hangingPunctuation/, { op: "componentize", id: "a", instances: ["b"] });
+
+  const baseList = JSON.parse(JSON.stringify(base));
+  delete baseList.nodes[1].children[0].hangingPunctuation;
+  baseList.nodes[1].children[0].hangingList = true;
+  rejects(normalize(baseList), /differs at children\[0\]\.hangingList/, { op: "componentize", id: "a", instances: ["b"] });
+});
+
+test("componentize fail-closed coverage: every non-exempt PATCH_SET_KEYS difference is rejected", () => {
+  const exempt = new Set(COMPONENTIZE_DIFF_EXEMPT_PATCH_KEYS);
+  assert.ok(exempt.has("name") && exempt.has("x") && exempt.has("y"));
+  assert.equal(COMPONENTIZE_DIFF_EXEMPT.length > 0, true);
+
+  const textOnly = new Set(["text", "font", "lineHeight", "letterSpacing", "align", "verticalAlignment", "textDecoration", "textCase", "paragraphSpacing", "paragraphIndent", "listSpacing", "hangingPunctuation", "hangingList", "textAutoResize", "textTruncation", "maxLines", "runs"]);
+  const hostTypeFor = (key: PatchSetKey): string | null => {
+    const applies = PATCH_SET_APPLIES_TO[key];
+    if (applies === null) return "RECTANGLE";
+    const preferred = textOnly.has(key)
+      ? ["TEXT", "RECTANGLE", "FRAME", "ELLIPSE", "POLYGON", "STAR", "VECTOR", "LINE"]
+      : ["RECTANGLE", "FRAME", "ELLIPSE", "POLYGON", "STAR", "VECTOR", "LINE", "TEXT"];
+    for (const t of preferred) {
+      if (applies.includes(t)) return t;
+    }
+    return null;
+  };
+
+  const diffValue = (key: PatchSetKey, host: string): unknown => {
+    const sample: Partial<Record<PatchSetKey, unknown>> = {
+      w: 77, h: 66, rotation: 11,
+      fill: "#FF00AA", fills: ["#FF00AA"], stroke: "#00AAFF", strokes: ["#00AAFF"],
+      strokeWeight: 3, strokeTopWeight: 2, strokeRightWeight: 2, strokeBottomWeight: 2, strokeLeftWeight: 2,
+      strokeAlign: "OUTSIDE", strokeCap: "ROUND", strokeJoin: "ROUND", dashPattern: [2, 2],
+      cornerRadius: 5, cornerRadii: [1, 2, 3, 4], opacity: 0.42, blendMode: "MULTIPLY",
+      locked: true, isMask: true, clipsContent: false,
+      effects: [{ type: "LAYER_BLUR", blur: 3 }], elevation: "LOW", shadow: { y: 2, blur: 4 },
+      layout: { direction: "VERTICAL", itemSpacing: 9 },
+      layoutGrids: [{ pattern: "GRID", sectionSize: 8 }],
+      minWidth: 11, maxWidth: 200, minHeight: 7, maxHeight: 150,
+      text: "DIFF", font: { family: "Roboto", style: "Bold", size: 18 },
+      lineHeight: 1.5, letterSpacing: { unit: "PIXELS", value: 2 }, align: "CENTER", verticalAlignment: "BOTTOM",
+      textDecoration: "UNDERLINE", textCase: "UPPER",
+      paragraphSpacing: 5, paragraphIndent: 3, listSpacing: 4,
+      hangingPunctuation: true, hangingList: true,
+      textAutoResize: "HEIGHT", textTruncation: "ENDING", maxLines: 2,
+      runs: [{ text: "Di" }, { text: "ff", fill: "#FF0000" }],
+      pointCount: 6, innerRadius: 0.3, startingAngle: 0.5, endingAngle: 2, innerRadiusRatio: 0.4,
+      vectorPaths: [{ windingRule: "NONZERO", data: "M 0 0 L 10 10 Z" }],
+      overflowDirection: "VERTICAL", numberOfFixedChildren: 1,
+      prototype: [{ trigger: { type: "ON_CLICK" }, actions: [{ type: "URL", url: "https://example.com" }] }],
+      styleRefs: { fill: "Ink" }, bindings: { opacity: "gap" },
+      // intentionally not covering exempt / component-only / deferred here
+    };
+    if (key in sample) return sample[key];
+    // Fallback scalars
+    if (host === "TEXT") return true;
+    return 3;
+  };
+
+  const expectedSegment = (key: PatchSetKey): string => {
+    if (key === "w" || key === "h") return "size";
+    if (key === "x" || key === "y") return "position";
+    if (key === "fill" || key === "fills") return "fill";
+    if (key === "stroke" || key === "strokes") return "stroke";
+    if (key === "effects" || key === "elevation" || key === "shadow") return "effects";
+    return key;
+  };
+
+  const baseChild = (id: string, host: string): Record<string, unknown> => {
+    const common = { id, name: "Leaf", x: 4, y: 4, w: 40, h: 24 };
+    if (host === "TEXT") return { ...common, type: "TEXT", text: "Hi", font: { family: "Inter", style: "Regular", size: 12 }, fills: [] };
+    if (host === "FRAME") return { ...common, type: "FRAME", fill: "#EEEEEE", children: [] };
+    if (host === "ELLIPSE") return { ...common, type: "ELLIPSE", fill: "#111111" };
+    if (host === "POLYGON") return { ...common, type: "POLYGON", fill: "#111111", pointCount: 5 };
+    if (host === "STAR") return { ...common, type: "STAR", fill: "#111111", pointCount: 5, innerRadius: 0.5 };
+    if (host === "VECTOR") return { ...common, type: "VECTOR", vectorPaths: [{ windingRule: "NONZERO", data: "M 0 0 L 1 1 Z" }] };
+    if (host === "LINE") return { ...common, type: "LINE", w: 40, h: 0 };
+    return { ...common, type: "RECTANGLE", fill: "#111111" };
+  };
+
+  let covered = 0;
+  const skipped: string[] = [];
+  for (const key of PATCH_SET_KEYS) {
+    if (exempt.has(key)) { skipped.push(`${key}:exempt`); continue; }
+    if (PATCH_SET_SEMANTICS[key] === "deferred" || PATCH_SET_SEMANTICS[key] === "immutable") {
+      skipped.push(`${key}:semantics`);
+      continue;
+    }
+    // Component-definition keys can't appear as the sole diff on a FRAME-copy subtree's inner layer in this fixture.
+    if (["componentProperties", "instanceProperties", "componentPropertyReferences", "variantAxes", "variant", "operation", "componentId", "svg"].includes(key)) {
+      skipped.push(`${key}:host`);
+      continue;
+    }
+    const host = hostTypeFor(key);
+    if (!host) { skipped.push(`${key}:no-host`); continue; }
+
+    // bindings/styleRefs need tokens — use a dedicated minimal pair without token deps for most keys;
+    // for bindings/styleRefs, skip if we can't resolve without variables (covered by dedicated bindings test).
+    if (key === "bindings" || key === "styleRefs") {
+      skipped.push(`${key}:tokens`);
+      continue;
+    }
+
+    const value = diffValue(key, host);
+    const sourceChild = baseChild("a-leaf", host);
+    const copyChild: Record<string, unknown> = { ...baseChild("b-leaf", host), [key]: value };
+    // Authoring: `fills` wins over `fill` in normalize — drop the other form so the key under test sticks.
+    if (key === "fill") delete copyChild.fills;
+    if (key === "fills") delete copyChild.fill;
+    if (key === "stroke") delete copyChild.strokes;
+    if (key === "strokes") delete copyChild.stroke;
+    // strokeCap only on LINE/VECTOR/ELLIPSE — ensure host matches
+    if (key === "strokeCap" && host === "RECTANGLE") {
+      skipped.push(`${key}:applies`);
+      continue;
+    }
+
+    const document = normalize({
+      canvas: { id: "page", width: 400, height: 200 },
+      nodes: [
+        { id: "a", type: "FRAME", name: "Card", x: 0, y: 0, w: 100, h: 60, fill: "#FFFFFF", children: [sourceChild] },
+        { id: "b", type: "FRAME", name: "Card", x: 120, y: 0, w: 100, h: 60, fill: "#FFFFFF", children: [copyChild] }
+      ]
+    });
+    const segment = expectedSegment(key);
+    const pattern = new RegExp(`differs at children\\[0\\]\\.${segment}\\b`);
+    const result = validatePatch(document, patchOf({ op: "componentize", id: "a", instances: ["b"] }));
+    assert.equal(result.valid, false, `key=${key} should reject; issues=${result.issues.map((i) => i.message).join("; ")}`);
+    assert.match(result.issues.map((i) => i.message).join("\n"), pattern, `key=${key} expected ${pattern}`);
+    covered++;
+  }
+  assert.ok(covered >= 40, `expected broad coverage, covered=${covered}, skipped=${skipped.join(",")}`);
+  // Explicitly ensure the Gate repro keys were in the loop (not exempt).
+  assert.equal(exempt.has("hangingPunctuation"), false);
+  assert.equal(exempt.has("hangingList"), false);
+});
+
+const anatomyFixture = () => normalize({
+  variables: [{ name: "Tokens", items: [{ id: "surface", name: "color/surface", type: "COLOR", value: { r: 1, g: 2, b: 3, a: 1 } }, { id: "space-16", name: "space/16", type: "FLOAT", value: 16 }] }],
+  styles: [{ id: "body", name: "Text/Body", type: "TEXT", font: { family: "Inter", style: "Regular", size: 14 } }],
+  canvas: { id: "screen", name: "Screen", width: 400, height: 300 },
+  nodes: [
+    { id: "btn", name: "Button", type: "COMPONENT", w: 100, h: 40, componentProperties: [{ name: "Label", type: "TEXT", defaultValue: "Go" }] },
+    { id: "card", name: "Card", type: "FRAME", x: 0, y: 60, w: 320, h: 200, layout: { direction: "VERTICAL", itemSpacing: 16, padding: { left: 24, top: 24, right: 24, bottom: 24 } }, bindings: { fill: "surface", itemSpacing: "space/16", stroke: "ghost-token" }, children: [
+      { id: "title", name: "Title", type: "TEXT", w: 272, h: 20, text: "Hi", styleRefs: { text: "body" }, layoutSizingHorizontal: "FILL", layoutSizingVertical: "HUG" },
+      { id: "cta", name: "CTA", type: "INSTANCE", componentId: "btn", w: 100, h: 40, instanceProperties: { Label: "Buy" } },
+      { id: "badge", name: "Badge", type: "FRAME", w: 20, h: 20, layoutPositioning: "ABSOLUTE", visible: false }
+    ] },
+    { id: "grid", name: "Grid", type: "FRAME", x: 0, y: 270, w: 200, h: 20, layout: { direction: "GRID", itemSpacing: 8, counterAxisSpacing: 12 } }
+  ]
+});
+
+test("anatomyMarkdown fixture snapshot: tree, layout, sizing, bindings, styles, instance, hidden, absolute, grid, tables", () => {
+  assert.equal(anatomyMarkdown(anatomyFixture(), { warnings: ["Instance 'X' was flattened to an editable frame because its main component was outside the selection."] }), [
+    "# Anatomy",
+    "",
+    "## Screen",
+    "",
+    "- **Screen** (frame, 400×300)",
+    "  - **Button** (component, 100×40) · component props Label",
+    "  - **Card** (frame, 320×200) · VERTICAL gap 16 · pad 24/24/24/24 · fill→color/surface · itemSpacing→space/16 · stroke→ghost-token ⚠ unresolved",
+    "    - **Title** (text, 272×20) · W fill / H hug · text style→Text/Body",
+    "    - **CTA** (instance, 100×40) · instance of Button {Label=Buy}",
+    "    - **Badge** (frame, 20×20) · hidden · absolute",
+    "  - **Grid** (frame, 200×20) · GRID gap 8×12",
+    "",
+    "## Tokens used",
+    "",
+    "| Token | Collection | Type | Used by |",
+    "| --- | --- | --- | --- |",
+    "| color/surface | Tokens | COLOR | Card (fill) |",
+    "| space/16 | Tokens | FLOAT | Card (itemSpacing) |",
+    "| ghost-token ⚠ unresolved | — | — | Card (stroke) |",
+    "",
+    "## Styles used",
+    "",
+    "| Style | Type | Used by |",
+    "| --- | --- | --- |",
+    "| Text/Body | TEXT | Title (text) |",
+    "",
+    "## Notes",
+    "",
+    "- Slots are not shown: the Figma export skips them.",
+    "- Instance 'X' was flattened to an editable frame because its main component was outside the selection.",
+    ""
+  ].join("\n"));
+});
+
+test("anatomy() fixture snapshot of the Card subtree", () => {
+  const [screen] = anatomy(anatomyFixture());
+  assert.deepEqual(screen.children[1], {
+    id: "card", name: "Card", role: "frame", size: { width: 320, height: 200 },
+    layout: { direction: "VERTICAL", gap: 16, padding: [24, 24, 24, 24] },
+    bindings: {
+      fill: { ref: "surface", name: "color/surface", collection: "Tokens", type: "COLOR", resolved: true },
+      itemSpacing: { ref: "space/16", name: "space/16", collection: "Tokens", type: "FLOAT", resolved: true },
+      stroke: { ref: "ghost-token", name: "ghost-token", resolved: false }
+    },
+    children: [
+      { id: "title", name: "Title", role: "text", size: { width: 272, height: 20 }, sizing: { horizontal: "FILL", vertical: "HUG" }, styles: { text: { ref: "body", name: "Text/Body", type: "TEXT", resolved: true } }, children: [] },
+      { id: "cta", name: "CTA", role: "instance", size: { width: 100, height: 40 }, instance: { resolved: true, componentId: "btn", componentName: "Button", properties: { Label: "Buy" } }, children: [] },
+      { id: "badge", name: "Badge", role: "frame", size: { width: 20, height: 20 }, hidden: true, sizing: { positioning: "ABSOLUTE" }, children: [] }
+    ]
+  });
+  assert.deepEqual(screen.children[2].layout, { direction: "GRID", gap: 8, crossGap: 12 });
+  assert.deepEqual(screen.children[0].component, { properties: ["Label"] });
+});
+
+test("anatomy resolves bindings and styleRefs by id then name, and keeps unresolved keys flagged", () => {
+  const document = anatomyFixture();
+  const card = document.nodes[0].children[1];
+  card.properties.styleRefs = { fill: "missing-style" };
+  const [screen] = anatomy(document);
+  assert.equal(screen.children[1].bindings?.fill.name, "color/surface");
+  assert.equal(screen.children[1].bindings?.itemSpacing.ref, "space/16");
+  assert.deepEqual(screen.children[1].bindings?.stroke, { ref: "ghost-token", name: "ghost-token", resolved: false });
+  assert.deepEqual(screen.children[1].styles?.fill, { ref: "missing-style", name: "missing-style", resolved: false });
+  assert.match(anatomyMarkdown(document), /\| missing-style ⚠ unresolved \| — \| Card \(fill\) \|/);
+});
+
+test("anatomy: one section per canvas in a multi-canvas document", () => {
+  const document = normalize({ canvases: [
+    { id: "a", name: "Home", width: 100, height: 100, nodes: [{ id: "h", name: "Hero", type: "FRAME", w: 50, h: 50 }] },
+    { id: "b", name: "Settings", width: 200, height: 100, nodes: [{ id: "s", name: "Row", type: "RECTANGLE", w: 10, h: 10 }] }
+  ] });
+  assert.deepEqual(anatomy(document).map((root) => [root.name, root.children.map((child) => child.name)]), [["Home", ["Hero"]], ["Settings", ["Row"]]]);
+  const markdown = anatomyMarkdown(document);
+  assert.equal((markdown.match(/^## (Home|Settings)$/gm) || []).length, 2);
+  assert.ok(markdown.indexOf("## Home") < markdown.indexOf("## Settings"));
+  assert.match(markdown, /## Tokens used\n\n_None\._/);
+  assert.ok(markdown.endsWith(`## Notes\n\n- ${ANATOMY_SLOT_NOTE}\n`), "slot note is always present, even with no warnings");
+});
+
+test("anatomy: an instance is a leaf with its properties, and a missing main component is flagged", () => {
+  const document = normalize({ canvas: { width: 100, height: 100 }, nodes: [
+    { id: "button", name: "Button", type: "COMPONENT", w: 20, h: 20 },
+    { id: "copy", name: "Copy", type: "INSTANCE", componentId: "button", w: 20, h: 20, instanceProperties: { Disabled: true }, children: [{ id: "inner", type: "FRAME", w: 10, h: 10 }] }
+  ] });
+  document.nodes[0].children.push({ ...document.nodes[0].children[1], id: "orphan", name: "Orphan", properties: { ...document.nodes[0].children[1].properties, componentId: "gone" }, children: [] });
+  const [root] = anatomy(document);
+  assert.deepEqual(root.children[1].children, [], "instance sublayers are not listed");
+  assert.deepEqual(root.children[1].instance, { resolved: true, componentId: "button", componentName: "Button", properties: { Disabled: true } });
+  assert.deepEqual(root.children[2].instance?.resolved, false);
+  const markdown = anatomyMarkdown(document);
+  assert.match(markdown, /\*\*Copy\*\* \(instance, 20×20\) · instance of Button \{Disabled=true\}/);
+  assert.match(markdown, /instance of gone ⚠ unresolved/);
+});
+
+test("anatomy: missing or mixed values render as 'mixed' and names are Markdown-escaped", () => {
+  const document = normalize({ canvas: { width: 100, height: 100 }, nodes: [{ id: "f", name: "A*B|C", type: "FRAME", w: 10, h: 10, layout: { direction: "HORIZONTAL", itemSpacing: 4, padding: { left: 2 } } }] });
+  const frame = document.nodes[0].children[0];
+  (frame.properties.layout as Record<string, unknown>).itemSpacing = "MIXED";
+  (frame.properties.size as Record<string, unknown>).height = Number.NaN;
+  const [root] = anatomy(document);
+  assert.deepEqual(root.children[0].layout, { direction: "HORIZONTAL", gap: "mixed", padding: [0, 0, 0, 2] });
+  assert.deepEqual(root.children[0].size, { width: 10, height: "mixed" });
+  assert.match(anatomyMarkdown(document), /- \*\*A\\\*B\\\|C\*\* \(frame, 10×mixed\) · HORIZONTAL gap mixed · pad 0\/0\/0\/2/);
+});
+
+test("anatomyMarkdown always adds a single-line slot note before any warnings", () => {
+  assert.equal(ANATOMY_SLOT_NOTE, "Slots are not shown: the Figma export skips them.");
+  assert.doesNotMatch(ANATOMY_SLOT_NOTE, /\n/);
+  const plain = anatomyMarkdown(normalize({ canvas: { width: 10, height: 10 }, nodes: [] }));
+  assert.equal((plain.match(/Slots are not shown/g) || []).length, 1);
+  const warned = anatomyMarkdown(normalize({ canvas: { width: 10, height: 10 }, nodes: [] }), { warnings: ["w1", "w2"] });
+  assert.match(warned, /## Notes\n\n- Slots are not shown: the Figma export skips them\.\n- w1\n- w2\n$/);
+});
+
+test("anatomy is pure core: no host API", () => {
+  assert.doesNotMatch(readFileSync("src/anatomy.ts", "utf8"), /\bfigma\s*\.|SceneNode|@figma\//);
+});
+
+// ---- redlines (brief 2 of 3) ----
+import { measureSpacing as coreMeasureSpacing, redlines, REDLINE_NO_TOKENS_NOTE, REDLINE_TOKEN_LABEL, REDLINE_WRAP_NOTE } from "../src/index";
+
+const SPACE_TOKENS = [{ name: "Space", modes: ["Compact", "Comfy"], items: [{ id: "s8", name: "space/8", type: "FLOAT", values: { Compact: 8, Comfy: 12 } }, { id: "s16", name: "space/16", type: "FLOAT", value: 16 }] }];
+const redlineDoc = (frame: Record<string, unknown>, variables: unknown[] = SPACE_TOKENS) =>
+  normalize({ variables, canvas: { id: "c", name: "C", width: 800, height: 600 }, nodes: [{ id: "f", name: "Frame", type: "FRAME", w: 400, h: 300, ...frame }] } as never);
+/** The redlined frame "f" (the canvas wrapper is a container too). */
+const frameOf = (doc: InternalDocument) => redlines(doc).find((entry) => entry.id === "f")!;
+const rect = (id: string, x: number, y = 0, extra: Record<string, unknown> = {}) => ({ id, name: id.toUpperCase(), type: "RECTANGLE", x, y, w: 10, h: 10, ...extra });
+const row = (gaps: number[]) => { let x = 0; return [rect("a", 0), ...gaps.map((gap, index) => { x += 10 + gap; return rect(`k${index}`, x); })]; };
+
+test("redlines: 3 children give 2 neighbour gaps in child order", () => {
+  const frame = frameOf(redlineDoc({ children: row([8, 12]) }));
+  assert.deepEqual(frame.gaps.map((gap) => [gap.from, gap.to]), [["a", "k0"], ["k0", "k1"]]);
+  assert.deepEqual(frame.gaps[0].spacing, { kind: "apart", h: 8, v: 0, axes: ["h"] });
+  assert.equal(frame.padding, undefined, "no auto-layout, no declared padding");
+});
+
+test("redlines: a value equal to a FLOAT token in any mode is on-token; an off-token value is flagged", () => {
+  const frame = frameOf(redlineDoc({ children: row([8, 12, 10]) }));
+  assert.deepEqual(frame.gaps.map((gap) => gap.offToken), [false, false, true], "8 = Compact, 12 = Comfy, 10 matches nothing");
+});
+
+test("redlines: bound padding/itemSpacing are on-token; unbound off-token padding is flagged per side", () => {
+  const doc = redlineDoc({ layout: { direction: "HORIZONTAL", itemSpacing: 10, padding: { left: 10, top: 16, right: 0, bottom: 10 } }, bindings: { itemSpacing: "s8", paddingLeft: "s8" }, children: row([10, 10]) });
+  const frame = frameOf(doc);
+  assert.deepEqual(frame.padding, { l: 10, t: 16, r: 0, b: 10, offToken: ["b"] }, "L bound, T = token, R = 0, B off-token");
+  assert.deepEqual(frame.gaps.map((gap) => [gap.expected, gap.mismatch, gap.offToken]), [[10, undefined, false], [10, undefined, false]]);
+});
+
+test("redlines: auto-layout gap differing from itemSpacing by > 0.5px is a mismatch; within 0.5 is not", () => {
+  const frame = frameOf(redlineDoc({ layout: { direction: "HORIZONTAL", itemSpacing: 8 }, children: row([8.4, 9]) }));
+  assert.deepEqual(frame.gaps.map((gap) => gap.mismatch), [undefined, true]);
+  assert.ok(frame.gaps.every((gap) => gap.expected === 8 && !gap.offToken));
+});
+
+test("redlines: SPACE_BETWEEN gaps are never flagged", () => {
+  const frame = frameOf(redlineDoc({ layout: { direction: "HORIZONTAL", itemSpacing: 3, primaryAxisAlignItems: "SPACE_BETWEEN" }, children: row([37, 41]) }));
+  assert.ok(frame.gaps.every((gap) => !gap.mismatch && !gap.offToken));
+  assert.equal(frame.gaps.length, 2);
+});
+
+test("redlines: absolute and hidden children are skipped, pairing the remaining neighbours", () => {
+  const frame = frameOf(redlineDoc({ layout: { direction: "VERTICAL", itemSpacing: 8 }, children: [rect("a", 0, 0), rect("abs", 0, 100, { layoutPositioning: "ABSOLUTE" }), rect("hid", 0, 50, { visible: false }), rect("b", 0, 18)] }));
+  assert.deepEqual(frame.gaps.map((gap) => [gap.from, gap.to, gap.mismatch]), [["a", "b", undefined]]);
+});
+
+test("redlines: negative itemSpacing compares the signed overlap", () => {
+  const frame = frameOf(redlineDoc({ layout: { direction: "HORIZONTAL", itemSpacing: -4 }, children: row([-4, -2]) }));
+  assert.equal(frame.gaps[0].spacing.kind, "overlap");
+  assert.deepEqual(frame.gaps.map((gap) => gap.mismatch), [undefined, true]);
+});
+
+test("redlines: 0 and 1 children give no gaps; wrapping layouts are skipped with a note", () => {
+  assert.deepEqual(frameOf(redlineDoc({ children: [] })).gaps, []);
+  assert.deepEqual(frameOf(redlineDoc({ children: [rect("a", 0)] })).gaps, []);
+  const wrap = frameOf(redlineDoc({ layout: { direction: "HORIZONTAL", itemSpacing: 8, wrap: true }, children: row([8, 8]) }));
+  assert.deepEqual([wrap.gaps, wrap.notes], [[], [REDLINE_WRAP_NOTE]]);
+});
+
+test("redlines: overlap and inset are reported as measured, not token-checked", () => {
+  const frame = frameOf(redlineDoc({ children: [rect("a", 0, 0, { w: 50, h: 50 }), rect("in", 5, 5), rect("ov", 10, 10)] }));
+  assert.deepEqual(frame.gaps.map((gap) => [gap.spacing.kind, gap.offToken]), [["inset", false], ["overlap", false]]);
+});
+
+test("redlines: with no FLOAT tokens every unbound non-zero value is flagged and Markdown says so", () => {
+  const doc = redlineDoc({ layout: { direction: "HORIZONTAL", itemSpacing: 8, padding: { left: 8 } }, children: row([8]) }, []);
+  const frame = frameOf(doc);
+  assert.deepEqual([frame.padding?.offToken, frame.gaps[0].offToken], [["l"], true]);
+  const markdown = anatomyMarkdown(doc, { redlines: true });
+  assert.ok(markdown.includes(REDLINE_NO_TOKENS_NOTE));
+  assert.ok(markdown.includes(REDLINE_TOKEN_LABEL));
+});
+
+test("anatomyMarkdown redlines option appends a Redlines section; off by default", () => {
+  const doc = redlineDoc({ layout: { direction: "HORIZONTAL", itemSpacing: 8, padding: { left: 10 } }, children: row([8, 9]) });
+  assert.ok(!anatomyMarkdown(doc).includes("## Redlines"));
+  const markdown = anatomyMarkdown(doc, { redlines: true });
+  assert.ok(markdown.trimEnd().split("\n## ").pop()!.startsWith("Redlines"), "Redlines is the last section");
+  assert.ok(markdown.includes("  - padding L 10 · T 0 · R 0 · B 0 px ⚠ off-token L"));
+  assert.ok(markdown.includes("  - A → K0: H 8 px (itemSpacing 8)"));
+  assert.ok(markdown.includes("  - K0 → K1: H 9 px ⚠ ≠ itemSpacing 8"));
+});
+
+test("core measureSpacing is the shared geometry (symmetric)", () => {
+  const a = { x: 0, y: 0, width: 10, height: 10 }, b = { x: 20, y: 30, width: 5, height: 5 };
+  assert.deepEqual(coreMeasureSpacing(a, b), coreMeasureSpacing(b, a));
+});
+
+// ---- agent bundle (brief 3 of 3) ----
+import { agentBundle, AGENT_BUNDLE_ID_PLACEHOLDER, AGENT_BUNDLE_RULES } from "../src/index";
+
+const bundleSource = () => ({
+  variables: [{ name: "Theme", modes: ["Light", "Dark"], items: [{ id: "fg", name: "color/fg", type: "COLOR", values: { Light: { r: 0, g: 0, b: 0, a: 1 }, Dark: { r: 1, g: 1, b: 1, a: 1 } } }, { id: "s8", name: "space/8", type: "FLOAT", value: 8 }] }],
+  styles: [{ id: "body", name: "Text/Body", type: "TEXT", font: { family: "Inter", style: "Regular", size: 14 } }],
+  canvases: [
+    { id: "home", name: "Home", width: 400, height: 300, nodes: [
+      { id: "btn", name: "Button", type: "COMPONENT", w: 100, h: 40, componentProperties: [{ name: "Label", type: "TEXT", defaultValue: "Go" }] },
+      { id: "row/1", name: "Row", type: "FRAME", y: 50, w: 200, h: 40, children: [
+        { id: "cta-1", name: "CTA", type: "INSTANCE", componentId: "btn", w: 100, h: 40, instanceProperties: { Label: "Buy" } },
+        { id: "cta-2", name: "CTA", type: "INSTANCE", componentId: "btn", x: 100, w: 100, h: 40 }
+      ] },
+      { id: "row/2", name: "Row", type: "FRAME", y: 100, w: 200, h: 40 },
+      { id: "slash", name: "A/B", type: "RECTANGLE", y: 150, w: 10, h: 10 }
+    ] },
+    { id: "settings", name: "Settings", x: 500, width: 400, height: 300, nodes: [{ id: "row-s", name: "Row", type: "FRAME", w: 200, h: 40 }] }
+  ]
+});
+
+test("agentBundle: version, doc unchanged, rules, anatomy without/with redlines", () => {
+  const source = bundleSource();
+  const snapshot = JSON.stringify(source);
+  const bundle = agentBundle(source);
+  assert.equal(bundle.version, 1);
+  assert.equal(bundle.doc, source);
+  assert.equal(JSON.stringify(source), snapshot, "input not mutated");
+  assert.equal(validate(bundle.doc).valid, true, "doc still validates");
+  assert.deepEqual(bundle.rules, ["Target layers by id, never by name", "x/y in patches are relative to the parent", "Run validatePatch before figma_patch"]);
+  assert.deepEqual(bundle.rules, [...AGENT_BUNDLE_RULES]);
+  assert.deepEqual(Object.keys(bundle.anatomy), ["anatomy"]);
+  assert.deepEqual(bundle.anatomy.anatomy.map((root) => root.name), ["Home", "Settings"]);
+  const withRedlines = agentBundle(source, { redlines: true });
+  assert.ok(Array.isArray(withRedlines.anatomy.redlines) && withRedlines.anatomy.redlines.some((entry) => entry.id === "row/1"));
+});
+
+test("agentBundle ids: repeated names map to arrays; byPath adds #n suffixes, escapes / in names, keeps / in ids, skips instance internals", () => {
+  const { ids } = agentBundle(bundleSource());
+  assert.deepEqual(ids.byName.Row, ["row/1", "row/2", "row-s"]);
+  assert.deepEqual(ids.byName.CTA, ["cta-1", "cta-2"]);
+  assert.equal(ids.byPath["Home/Row"], "row/1");
+  assert.equal(ids.byPath["Home/Row#2"], "row/2");
+  assert.equal(ids.byPath["Settings/Row"], "row-s", "other canvas: no suffix");
+  assert.equal(ids.byPath["Home/Row/CTA"], "cta-1");
+  assert.equal(ids.byPath["Home/Row/CTA#2"], "cta-2");
+  assert.equal(ids.byPath["Home/A\\/B"], "slash");
+  assert.equal(ids.byPath["Home/A/B"], undefined);
+  assert.equal(new Set(Object.values(ids.byPath)).size, Object.keys(ids.byPath).length, "one path per id");
+});
+
+test("agentBundle ids leave out layers inside instances", () => {
+  const source = bundleSource();
+  (source.canvases[0].nodes[1].children![0] as Record<string, unknown>).children = [{ id: "inner", name: "Inner", type: "TEXT", w: 10, h: 10, text: "x" }];
+  const { ids } = agentBundle(source);
+  assert.equal(Object.values(ids.byPath).includes("inner"), false);
+  assert.equal(ids.byName.Inner, undefined);
+});
+
+test("agentBundle tokens, styles and components are pulled out", () => {
+  const bundle = agentBundle(bundleSource());
+  assert.deepEqual(bundle.tokens, [
+    { key: "fg", name: "color/fg", type: "COLOR", collection: "Theme", values: { Light: { r: 0, g: 0, b: 0, a: 1 }, Dark: { r: 1, g: 1, b: 1, a: 1 } } },
+    { key: "s8", name: "space/8", type: "FLOAT", collection: "Theme", values: { Light: 8 } }
+  ]);
+  assert.deepEqual(bundle.styles, [{ id: "body", name: "Text/Body", type: "TEXT" }]);
+  assert.deepEqual(bundle.components.definitions, [{ id: "btn", name: "Button", type: "COMPONENT", componentProperties: [{ name: "Label", type: "TEXT", defaultValue: "Go" }] }]);
+  assert.deepEqual(bundle.components.instances, [
+    { id: "cta-1", name: "CTA", componentId: "btn", instanceProperties: { Label: "Buy" } },
+    { id: "cta-2", name: "CTA", componentId: "btn", instanceProperties: {} }
+  ]);
+});
+
+test("agentBundle patchTemplate: placeholder id; with a real id it passes validatePatch", () => {
+  const source = bundleSource();
+  const bundle = agentBundle(source);
+  assert.deepEqual(bundle.patchTemplate, { patch: { operations: [{ op: "set", id: AGENT_BUNDLE_ID_PLACEHOLDER, set: {} }] } });
+  const patch = JSON.parse(JSON.stringify(bundle.patchTemplate));
+  patch.patch.operations[0].id = bundle.ids.byPath["Home/Row#2"];
+  patch.patch.operations[0].set = { name: "Row 2" };
+  const result = validatePatch(normalize(source), patch);
+  assert.equal(result.valid, true, JSON.stringify(result.issues));
+  const bare = JSON.parse(JSON.stringify(bundle.patchTemplate));
+  bare.patch.operations[0].id = "row/2";
+  assert.equal(validatePatch(normalize(source), bare).valid, false, "an unfilled (empty) set is still rejected: the agent must fill it");
+});
+
+test("agentBundle handles empty variables and styles", () => {
+  const bundle = agentBundle({ canvas: { id: "c", name: "C", width: 10, height: 10 }, nodes: [] });
+  assert.deepEqual([bundle.tokens, bundle.styles, bundle.components], [[], [], { definitions: [], instances: [] }]);
+  assert.deepEqual(bundle.ids, { byName: { C: ["c"] }, byPath: { C: "c" } });
+});
+
+test("agentBundle byPath: children of a repeated parent hang off that parent's suffixed path", () => {
+  const { ids } = agentBundle({ canvas: { id: "cv", name: "Canvas", width: 400, height: 400 }, nodes: [
+    { id: "card-1", name: "Card", type: "FRAME", w: 100, h: 100, children: [{ id: "title-1", name: "Title", type: "TEXT", w: 50, h: 10, text: "One" }] },
+    { id: "card-2", name: "Card", type: "FRAME", y: 200, w: 100, h: 100, children: [{ id: "title-2", name: "Title", type: "TEXT", w: 50, h: 10, text: "Two" }] }
+  ] });
+  assert.equal(ids.byPath["Canvas/Card"], "card-1");
+  assert.equal(ids.byPath["Canvas/Card#2"], "card-2");
+  assert.equal(ids.byPath["Canvas/Card/Title"], "title-1");
+  assert.equal(ids.byPath["Canvas/Card#2/Title"], "title-2");
+  assert.equal(ids.byPath["Canvas/Card/Title#2"], undefined, "no suffix: each Title is first under its own parent");
+});
+
+// ---- system inventory (design system sheet, PR 1 of 2) ----
+import { colourHex, systemInventory } from "../src/index";
+
+const inventoryFixture = () => normalize({
+  variables: [{ name: "Tokens", items: [
+    { id: "red", name: "color/brand", type: "COLOR", value: { r: 1, g: 0, b: 0, a: 1 } },
+    { id: "s8", name: "space/8", type: "FLOAT", value: 8 },
+    { id: "r4", name: "radius/4", type: "FLOAT", value: 4 }
+  ] }],
+  styles: [{ id: "h1", name: "Text/H1", type: "TEXT", font: { family: "Inter", style: "Bold", size: 32 } }],
+  canvas: { id: "page", name: "Page", width: 800, height: 600 },
+  nodes: [
+    { id: "badge", name: "Badge", type: "COMPONENT", w: 40, h: 20, fill: "#FF0000", bindings: { fill: "red" }, cornerRadius: 4, children: [] },
+    { id: "card", name: "Card", type: "COMPONENT", x: 100, w: 200, h: 100, fill: "#FF0000", cornerRadius: 4, bindings: { cornerRadius: "r4" },
+      layout: { direction: "VERTICAL", itemSpacing: 8, padding: { top: 8, right: 16, bottom: 12, left: 8 } },
+      effects: [{ type: "DROP_SHADOW", color: "#00000040", offset: { x: 0, y: 2 }, radius: 4 }],
+      children: [
+        { id: "card-title", name: "Title", type: "TEXT", w: 100, h: 40, text: "Hi", font: { family: "Inter", style: "Bold", size: 32 }, styleRefs: { text: "h1" } },
+        { id: "card-body", name: "Body", type: "TEXT", w: 100, h: 20, text: "Yo", font: { family: "Inter", style: "Regular", size: 14 }, fill: "#FF0000" },
+        { id: "row", name: "Row", type: "FRAME", w: 100, h: 20, layout: { direction: "HORIZONTAL", itemSpacing: 8 }, bindings: { itemSpacing: "s8" }, children: [
+          { id: "card-badge", name: "Badge", type: "INSTANCE", componentId: "badge", w: 40, h: 20 }
+        ] }
+      ] },
+    { id: "screen", name: "Screen", type: "FRAME", x: 400, w: 300, h: 300, fill: "#00FF00", children: [
+      { id: "screen-card", name: "Card", type: "INSTANCE", componentId: "card", w: 200, h: 100 },
+      { id: "ghost", name: "Ghost", type: "INSTANCE", componentId: "gone", w: 10, h: 10 }
+    ] }
+  ]
+} as never);
+
+test("systemInventory: a token-bound colour and the same raw hex are two separate entries", () => {
+  const { colours } = systemInventory(inventoryFixture());
+  const red = colours.filter((entry) => entry.value === "#FF0000");
+  assert.equal(red.length, 2, JSON.stringify(red));
+  const bound = red.find((entry) => entry.token)!, raw = red.find((entry) => !entry.token)!;
+  assert.deepEqual(bound.token, { kind: "variable", ref: "red", name: "color/brand", resolved: true });
+  assert.deepEqual([bound.count, bound.nodeIds], [1, ["badge"]]);
+  assert.deepEqual([raw.count, raw.nodeIds], [2, ["card", "card-body"]]);
+  const counts = colours.map((entry) => entry.count);
+  assert.deepEqual(counts, [...counts].sort((a, b) => b - a), "colours sorted by usage");
+  assert.ok(colours.indexOf(raw) < colours.indexOf(bound), "raw red (2 uses) before bound red (1 use)");
+});
+
+test("systemInventory: a token-bound spacing/radius value and the same raw value are separate entries; ascending order", () => {
+  const { spacing, radius } = systemInventory(inventoryFixture());
+  const eights = spacing.filter((entry) => entry.value === 8);
+  assert.equal(eights.length, 2, JSON.stringify(eights));
+  assert.deepEqual(eights.find((entry) => entry.token)?.nodeIds, ["row"]);
+  assert.equal(eights.find((entry) => entry.token)?.token?.name, "space/8");
+  assert.deepEqual(eights.find((entry) => !entry.token)?.nodeIds, ["card"]);
+  assert.equal(eights.find((entry) => !entry.token)?.count, 1, "card: itemSpacing 8 + padding top 8 + left 8 = one layer, one use");
+  assert.deepEqual(spacing.map((entry) => entry.value), [8, 8, 12, 16], "mixed padding sides each counted, ascending");
+  const fours = radius.filter((entry) => entry.value === 4);
+  assert.equal(fours.length, 2);
+  assert.deepEqual(fours.find((entry) => entry.token)?.nodeIds, ["card"]);
+  assert.deepEqual(fours.find((entry) => !entry.token)?.nodeIds, ["badge"]);
+});
+
+test("systemInventory: type by size with style labels, effects, components incl. nested and missing instances", () => {
+  const inventory = systemInventory(inventoryFixture());
+  assert.deepEqual(inventory.type.map((entry) => [entry.value.size, entry.token?.name]), [[32, "Text/H1"], [14, undefined]]);
+  assert.equal(inventory.effects.length, 1);
+  assert.deepEqual(inventory.effects[0].nodeIds, ["card"]);
+  assert.deepEqual(inventory.components, [
+    { id: "badge", name: "Badge", instanceCount: 1, instanceIds: ["card-badge"] },
+    { id: "card", name: "Card", instanceCount: 1, instanceIds: ["screen-card"] },
+    { id: "gone", name: "gone", instanceCount: 1, instanceIds: ["ghost"], missing: true }
+  ]);
+});
+
+test("systemInventory: unresolved token refs keep the raw key; empty document gives empty lists", () => {
+  const doc = inventoryFixture();
+  doc.nodes[0].children[0].properties.bindings = { fill: "nope" };
+  const nope = systemInventory(doc).colours.find((entry) => entry.token?.ref === "nope");
+  assert.deepEqual(nope?.token, { kind: "variable", ref: "nope", name: "nope", resolved: false });
+  const empty = systemInventory(normalize({ canvas: { id: "c", name: "C", width: 10, height: 10 }, nodes: [] }));
+  // Only the canvas background (normalize defaults it to white) is left.
+  assert.deepEqual(empty, { colours: [{ value: "#FFFFFF", count: 1, nodeIds: ["c"] }], type: [], spacing: [], radius: [], effects: [], components: [] });
+  const bare = systemInventory({ nodes: [], styles: [], variables: [] });
+  assert.deepEqual(bare, { colours: [], type: [], spacing: [], radius: [], effects: [], components: [] });
+});
+
+test("systemInventory: a style-bound shadow and an identical raw shadow are two entries with different labels", () => {
+  const shadow = { type: "DROP_SHADOW", color: "#00000040", offset: { x: 0, y: 2 }, radius: 4 };
+  const doc = normalize({ canvas: { id: "c", name: "C", width: 100, height: 100 }, nodes: [
+    { id: "bound", name: "Bound", type: "FRAME", w: 10, h: 10, effects: [shadow], styleRefs: { effect: "Shadow/Small" } },
+    { id: "raw", name: "Raw", type: "FRAME", w: 10, h: 10, effects: [shadow] }
+  ] } as never);
+  doc.styles = [{ id: "Shadow/Small", name: "Shadow/Small", type: "EFFECT" as never }];
+  const { effects } = systemInventory(doc);
+  assert.equal(effects.length, 2, JSON.stringify(effects));
+  assert.deepEqual(effects[0].value, effects[1].value, "identical shadow values");
+  assert.deepEqual(effects.map((entry) => [entry.token?.name, entry.nodeIds]), [["Shadow/Small", ["bound"]], [undefined, ["raw"]]]);
+  assert.equal(effects[0].token?.resolved, true);
+});
+
+test("systemInventory: the canvas is a root node, so its background is listed in colours", () => {
+  const doc = normalize({ canvas: { id: "bg", name: "BG", width: 100, height: 100, fill: "#123456" }, nodes: [] });
+  assert.equal(doc.nodes[0].id, "bg", "normalize makes the canvas a root node");
+  assert.deepEqual(systemInventory(doc).colours, [{ value: "#123456", count: 1, nodeIds: ["bg"] }]);
+});
+
+test("colourHex: 0–255 channels with 0–1 alpha, matching normalize", () => {
+  assert.equal(colourHex({ r: 18, g: 52, b: 86, a: 1 }), "#123456");
+  assert.equal(colourHex({ r: 0, g: 0, b: 0, a: 0x40 / 255 }), "#00000040");
+  assert.equal(colourHex({ r: 255, g: 255, b: 255 }, 0.5), "#FFFFFF80");
+  const doc = normalize({ canvas: { id: "c", name: "C", width: 10, height: 10 }, nodes: [{ id: "n", name: "N", type: "RECTANGLE", w: 1, h: 1, fill: "#3366CC" }] });
+  assert.ok(systemInventory(doc).colours.some((entry) => entry.value === "#3366CC" && entry.nodeIds[0] === "n"));
+});
+
+// ---- system sheet (design system sheet, PR 2 of 2) ----
+import { systemSheet, systemSheetTokenPill, breakTokenName, sheetSpacingBar, sheetRadiusSample, sheetTypeMeta, SPACING_TRACK, RADIUS_SAMPLE, SHEET_THEME, SYSTEM_SHEET_SECTIONS } from "../src/index";
+const SHEET_OPTS = { sourceName: "Page", generatedAt: "15 Oct 2026" };
+const paintHex = (paint: unknown): string => { const p = paint as { color: { r: number; g: number; b: number; a?: number }; opacity?: number }; return colourHex(p.color, p.opacity ?? 1); };
+
+const sheetSource = () => normalize({
+  variables: [{ name: "T", items: [{ id: "red", name: "color/brand", type: "COLOR", value: { r: 255, g: 0, b: 0, a: 1 } }, { id: "s8", name: "space/8", type: "FLOAT", value: 8 }] }],
+  canvas: { id: "page", name: "Page", width: 400, height: 300 },
+  nodes: [
+    { id: "badge", name: "Badge", type: "COMPONENT", w: 40, h: 20, fill: "#FF0000", bindings: { fill: "red" }, cornerRadius: 4 },
+    { id: "card", name: "Card", type: "FRAME", x: 100, w: 200, h: 100, fill: "#FF0000", layout: { direction: "VERTICAL", itemSpacing: 8, padding: { top: 8 } }, bindings: { itemSpacing: "s8" },
+      effects: [{ type: "DROP_SHADOW", color: "#00000040", offset: { x: 0, y: 2 }, radius: 4 }],
+      children: [{ id: "label", name: "Label", type: "TEXT", w: 50, h: 20, text: "Hi", font: { family: "Inter", style: "Bold", size: 16 }, fill: "#111111" }, { id: "b1", name: "Badge", type: "INSTANCE", componentId: "badge", w: 40, h: 20 }, { id: "g1", name: "Ghost", type: "INSTANCE", componentId: "gone", w: 10, h: 10 }] }
+  ]
+} as never);
+
+function sheetOutline(doc: InternalDocument): string[] {
+  const out: string[] = [];
+  const walk = (node: InternalNode, depth: number): void => {
+    out.push(`${"  ".repeat(depth)}${node.id} ${node.type} ${node.name}${node.properties.text !== undefined ? ` = ${node.properties.text}` : ""}`);
+    node.children.forEach((child) => walk(child, depth + 1));
+  };
+  doc.nodes.forEach((node) => walk(node, 0));
+  return out;
+}
+
+test("systemSheet snapshot: root FRAME, header + five sections, themed renderers, bound vs raw pills", () => {
+  const sheet = systemSheet(systemInventory(sheetSource()), { id: "ss", origin: { x: 560, y: 20 }, ...SHEET_OPTS });
+  assert.equal(sheet.nodes.length, 1);
+  const root = sheet.nodes[0];
+  assert.deepEqual([root.type, root.properties.layout?.direction, root.properties.position], ["FRAME", "VERTICAL", { x: 560, y: 20 }]);
+  assert.deepEqual(root.children.slice(1).map((child) => child.name), [...SYSTEM_SHEET_SECTIONS]);
+  const outline = sheetOutline(sheet);
+  assert.deepEqual(outline.slice(0, 20), [
+    "ss FRAME Design system sheet",
+    "  ss-header FRAME Header",
+    "    ss-eyebrow TEXT DESIGN SYSTEM = DESIGN SYSTEM",
+    "    ss-title TEXT Page = Page",
+    "    ss-generated TEXT Generated 15 Oct 2026 = Generated 15 Oct 2026",
+    "    ss-counts FRAME Counts",
+    "      ss-count-colours FRAME 4 Colours",
+    "        ss-count-colours-value TEXT 4 = 4",
+    "        ss-count-colours-label TEXT Colours = Colours",
+    "      ss-count-type FRAME 1 Type style",
+    "        ss-count-type-value TEXT 1 = 1",
+    "        ss-count-type-label TEXT Type style = Type style",
+    "      ss-count-spacing FRAME 2 Spacing values",
+    "        ss-count-spacing-value TEXT 2 = 2",
+    "        ss-count-spacing-label TEXT Spacing values = Spacing values",
+    "      ss-count-radius FRAME 1 Radius",
+    "        ss-count-radius-value TEXT 1 = 1",
+    "        ss-count-radius-label TEXT Radius = Radius",
+    "      ss-count-effects FRAME 1 Effect",
+    "        ss-count-effects-value TEXT 1 = 1"
+  ]);
+  const colours = outline.slice(outline.indexOf("  ss-colours FRAME Colours"), outline.indexOf("  ss-type FRAME Type"));
+  assert.deepEqual(colours.slice(0, 16), [
+    "  ss-colours FRAME Colours",
+    "    ss-colours-header FRAME Colours header",
+    "      ss-colours-title TEXT Colours = Colours",
+    "      ss-colours-note TEXT Solid colours used in this frame. Token-bound colours first, then raw values. = Solid colours used in this frame. Token-bound colours first, then raw values.",
+    "    ss-colours-divider RECTANGLE Divider",
+    "    ss-colours-bound FRAME Bound to tokens",
+    "      ss-colours-bound-heading TEXT Bound to tokens · 1 = Bound to tokens · 1",
+    "      ss-colours-bound-cards FRAME Bound to tokens cards",
+    "        ss-colours-1 FRAME #FF0000 · bound color/brand",
+    "          ss-colours-1-swatch RECTANGLE Swatch",
+    "          ss-colours-1-info FRAME Info",
+    "            ss-colours-1-value TEXT #FF0000 = #FF0000",
+    "            ss-colours-1-pill FRAME Token: color/brand",
+    "              ss-colours-1-pill-text TEXT color/brand = color/brand",
+    "            ss-colours-1-uses TEXT 1 use = 1 use",
+    "    ss-colours-raw FRAME Raw values"
+  ], "bound group first; tile id keeps the inventory index");
+  assert.deepEqual(colours.filter((line) => /^ {8}ss-colours-\d+ FRAME/.test(line)).map((line) => line.trim().split(" ")[0]), ["ss-colours-1", "ss-colours-0", "ss-colours-2", "ss-colours-3"], "raw group keeps inventory order");
+  assert.ok(outline.includes("            ss-colours-0-pill FRAME Raw") && outline.includes("              ss-colours-0-pill-text TEXT Raw = Raw"));
+  assert.ok(outline.includes("    ss-type-0 FRAME Inter Bold 16 · raw"));
+  assert.ok(outline.includes("        ss-type-0-meta TEXT Inter · Bold · 16 px · Line height auto · Letter spacing 0 = Inter · Bold · 16 px · Line height auto · Letter spacing 0"));
+  assert.ok(outline.includes("      ss-spacing-0 FRAME 8 px · bound space/8") && outline.includes("          ss-spacing-0-bar RECTANGLE Bar"));
+  assert.ok(outline.includes("        ss-radius-0-sample RECTANGLE Corner sample"));
+  const sample = (id: string): InternalNode => { let found: InternalNode | undefined; const walk = (node: InternalNode): void => { if (node.id === id) found = node; node.children.forEach(walk); }; walk(root); assert.ok(found, id); return found!; };
+  assert.equal(sample("ss-effects-0-sample").properties.styles.effects[0].type, "DROP_SHADOW", "effect sample carries the effect");
+  const specimen = sample("ss-type-0-sample");
+  assert.deepEqual([specimen.properties.text, specimen.properties.font], ["The quick brown fox jumps", { family: "Inter", style: "Bold", size: 16 }], "specimen in the exact font");
+  assert.equal(validateDocument({ ...sheet, nodes: sheet.nodes }).filter((issue) => issue.severity === "ERROR").length, 0);
+});
+
+test("systemSheet: token pills (bound accent / raw muted / unresolved amber); no ◆ and no outline on bound tiles; ids prefixed and stable", () => {
+  assert.deepEqual(systemSheetTokenPill(undefined), { kind: "raw", text: "Raw", unresolved: false });
+  assert.deepEqual(systemSheetTokenPill({ kind: "variable", ref: "x", name: "x", resolved: false }), { kind: "bound", text: "x", unresolved: true });
+  assert.deepEqual(systemSheetTokenPill({ kind: "style", ref: "y", name: "brand/y", resolved: true }), { kind: "bound", text: "brand/y", unresolved: false });
+  const inventory = systemInventory(sheetSource());
+  inventory.radius[0] = { ...inventory.radius[0], token: { kind: "variable", ref: "r", name: "radius/sm", resolved: false } };
+  const sheet = systemSheet(inventory, { id: "system-sheet-page", origin: { x: 0, y: 0 }, ...SHEET_OPTS });
+  const all: InternalNode[] = []; const walk = (node: InternalNode): void => { all.push(node); node.children.forEach(walk); }; walk(sheet.nodes[0]);
+  const byId = new Map(all.map((node) => [node.id, node]));
+  const fill = (id: string): string => paintHex(byId.get(id)!.properties.styles.fills[0]);
+  assert.ok(!all.some((node) => String(node.properties.text ?? "").includes("◆") || String(node.properties.text ?? "").includes("⚠")), "no diamond or warning glyphs");
+  const boundTile = byId.get("system-sheet-page-colours-1")!, rawTile = byId.get("system-sheet-page-colours-2")!;
+  assert.deepEqual(boundTile.properties.styles.strokes, rawTile.properties.styles.strokes, "bound and raw tiles share the same neutral card outline");
+  assert.equal(fill("system-sheet-page-colours-1-pill"), SHEET_THEME.colour.accentTint);
+  assert.equal(paintHex(byId.get("system-sheet-page-colours-1-pill-text")!.properties.styles.fills[0]), SHEET_THEME.colour.accent);
+  assert.equal(fill("system-sheet-page-colours-2-pill"), SHEET_THEME.colour.rawTint);
+  assert.equal(byId.get("system-sheet-page-radius-0-unresolved-text")!.properties.text, "Unresolved");
+  assert.equal(fill("system-sheet-page-radius-0-unresolved"), SHEET_THEME.colour.warningTint);
+  assert.ok(!byId.has("system-sheet-page-colours-1-unresolved"), "resolved tokens get no note");
+  const ids = all.map((node) => node.id);
+  assert.ok(ids.every((id) => id.startsWith("system-sheet-page")));
+  assert.equal(new Set(ids).size, ids.length, "ids unique");
+  assert.ok(!ids.some((id) => id.includes("-components")), "no Components section");
+  const again = systemSheet(inventory, { id: "system-sheet-page", origin: { x: 0, y: 0 }, ...SHEET_OPTS });
+  assert.deepEqual(again, sheet, "same options, same sheet (ids and all)");
+  const empty = systemSheet({ colours: [], type: [], spacing: [], radius: [], effects: [], components: [] }, { id: "e", origin: { x: 0, y: 0 }, ...SHEET_OPTS });
+  assert.deepEqual(empty.nodes[0].children.slice(1).map((section) => section.children[2].properties.text), Array(5).fill("None in this frame"));
+  assert.ok(empty.nodes[0].children.slice(1).every((section) => section.children.length === 3 && section.children[1].name === "Divider"));
+});
+
+test("systemSheet: no hex literal in system-sheet.ts (theme lives in SHEET_THEME)", () => {
+  const source = readFileSync(join("src", "system-sheet.ts"), "utf8");
+  assert.deepEqual(source.match(/#[0-9A-Fa-f]{3,8}\b/g) ?? [], []);
+  for (const key of ["background", "card", "text", "muted", "divider", "accent"] as const) assert.match(SHEET_THEME.colour[key], /^#[0-9A-F]{6}$/);
+  assert.ok(SHEET_THEME.type.title && SHEET_THEME.type.sectionHeading && SHEET_THEME.type.label && SHEET_THEME.type.monoValue);
+  assert.ok(SHEET_THEME.space.pageMargin > 0 && SHEET_THEME.space.sectionGutter > 0 && SHEET_THEME.space.cardPadding > 0 && SHEET_THEME.cardRadius > 0);
+});
+
+test("systemSheet: no theme colour leaks into the values shown; every displayed hex is an inventory colour", () => {
+  const raw = readFileSync(join("tests", "fixtures", "sample-frame.json"), "utf8");
+  const inventory = systemInventory(normalize(JSON.parse(raw)));
+  const sheet = systemSheet(inventory, { id: "sample", origin: { x: 0, y: 0 }, sourceName: "Sample frame", generatedAt: "15 Oct 2026" });
+  const all: InternalNode[] = []; const walk = (node: InternalNode): void => { all.push(node); node.children.forEach(walk); }; walk(sheet.nodes[0]);
+  const shown = all.flatMap((node) => String(node.properties.text ?? "").match(/#[0-9A-F]{6,8}\b/g) ?? []);
+  assert.deepEqual([...new Set(shown)].sort(), [...new Set(inventory.colours.map((entry) => entry.value))].sort(), "hex labels = inventory colours, nothing from the theme");
+  const swatches = all.filter((node) => node.name === "Swatch").map((node) => paintHex(node.properties.styles.fills[0]));
+  assert.deepEqual(swatches.sort(), inventory.colours.map((entry) => entry.value).sort(), "one swatch per inventory colour, painted with that colour");
+  const swatchIds = new Set(all.filter((node) => node.name === "Swatch").map((node) => node.id));
+  const themeValues = new Set(Object.values(SHEET_THEME.colour));
+  for (const node of all) {
+    if (swatchIds.has(node.id)) continue;
+    for (const paint of [...node.properties.styles.fills, ...node.properties.styles.strokes]) assert.ok(themeValues.has(paintHex(paint)), `${node.id}: chrome paint ${paintHex(paint)} comes from SHEET_THEME`);
+  }
+  assert.equal(sheet.nodes[0].children[0].children[1].properties.text, "Sample frame", "title is the source frame name");
+});
+
+test("systemSheet: spacing bars scale and clamp to the track (251 px fits); radius clamped to half the side", () => {
+  assert.equal(sheetSpacingBar(8), 16);
+  assert.ok(sheetSpacingBar(251) <= SPACING_TRACK && sheetSpacingBar(251) === 502, "251 px fits unclamped");
+  assert.equal(sheetSpacingBar(10000), SPACING_TRACK);
+  assert.equal(sheetSpacingBar(0), 1);
+  assert.equal(sheetRadiusSample(8), 8);
+  assert.equal(sheetRadiusSample(110), RADIUS_SAMPLE / 2);
+  assert.equal(sheetRadiusSample(-3), 0);
+  const inventory = systemInventory(sheetSource());
+  inventory.spacing = [{ value: 5000, count: 1, nodeIds: ["x"] }];
+  inventory.radius = [{ value: 999, count: 1, nodeIds: ["x"] }];
+  const sheet = systemSheet(inventory, { id: "c", origin: { x: 0, y: 0 }, ...SHEET_OPTS });
+  const all: InternalNode[] = []; const walk = (node: InternalNode): void => { all.push(node); node.children.forEach(walk); }; walk(sheet.nodes[0]);
+  const bar = all.find((node) => node.id === "c-spacing-0-bar")!, track = all.find((node) => node.id === "c-spacing-0-track")!;
+  assert.ok(bar.properties.size.width <= track.properties.size.width);
+  assert.equal(all.find((node) => node.id === "c-radius-0-sample")!.properties.cornerRadius, RADIUS_SAMPLE / 2);
+  assert.deepEqual(breakTokenName("brand/colors/primary", 17), ["brand/colors/", "primary"]);
+  assert.deepEqual(breakTokenName("short", 17), ["short"]);
+  assert.equal(sheetTypeMeta({ family: "Inter", style: "Medium", size: 14, lineHeight: { unit: "PIXELS", value: 20 }, letterSpacing: { unit: "PERCENT", value: 0.200000003 } }), "Inter · Medium · 14 px · Line height 20 px · Letter spacing 0.2%");
+});
+
+test("systemInventory: unset padding sides are skipped (no phantom 0); explicit 0 dropped too; anatomy unchanged", () => {
+  const doc = normalize({ canvas: { id: "c", name: "C", width: 100, height: 100 }, nodes: [
+    { id: "f", name: "F", type: "FRAME", w: 50, h: 50, layout: { direction: "HORIZONTAL", padding: { left: 12 } } }
+  ] } as never);
+  const { spacing } = systemInventory(doc);
+  assert.deepEqual(spacing.map((entry) => [entry.value, entry.nodeIds]), [[12, ["f"]]], "only paddingLeft; no 0 px entry");
+  assert.deepEqual(anatomy(doc)[0].children[0].layout?.padding, [0, 0, 0, 12], "anatomy still reports unset sides as 0");
+  const explicit = normalize({ canvas: { id: "c", name: "C", width: 100, height: 100 }, nodes: [
+    { id: "g", name: "G", type: "FRAME", w: 50, h: 50, layout: { direction: "HORIZONTAL", padding: { left: 12, top: 0 } } }
+  ] } as never);
+  assert.deepEqual(systemInventory(explicit).spacing.map((entry) => entry.value), [12], "zero spacing is dropped, even when set explicitly");
+});
+
+// ---- inventory counts: one use per layer, no zeros, component insides once, hidden skipped ----
+import { inventoryLayerKey } from "../src/index";
+
+test("inventory counts: one use per layer per value (16 on all sides = 1); zero spacing and radius dropped", () => {
+  const doc = normalize({ canvas: { id: "c", name: "C", width: 100, height: 100 }, nodes: [
+    { id: "f", name: "F", type: "FRAME", w: 50, h: 50, cornerRadius: 0, layout: { direction: "VERTICAL", itemSpacing: 16, padding: { left: 16, top: 16, right: 16, bottom: 16 } } },
+    { id: "g", name: "G", type: "FRAME", w: 50, h: 50, cornerRadii: [0, 4, 4, 0], layout: { direction: "HORIZONTAL", itemSpacing: 0, padding: { left: 0, top: 8 } } }
+  ] } as never);
+  const { spacing, radius } = systemInventory(doc);
+  assert.deepEqual(spacing.map((entry) => [entry.value, entry.count, entry.nodeIds]), [[8, 1, ["g"]], [16, 1, ["f"]]]);
+  assert.deepEqual(radius.map((entry) => [entry.value, entry.count, entry.nodeIds]), [[4, 1, ["g"]]]);
+});
+
+test("inventory counts: flattened instance insides count once per main-component layer; direct layers as before; nodeIds keep every id", () => {
+  assert.equal(inventoryLayerKey("I1:2;3:4"), "main:3:4");
+  assert.equal(inventoryLayerKey("I1:2;3:4;5:6"), "main:3:4;5:6");
+  assert.equal(inventoryLayerKey("7:8"), "7:8");
+  const copy = (instance: string, x: number) => ({ id: instance, name: "Card", type: "FRAME", x, w: 40, h: 40, fill: "#123456", children: [
+    { id: `I${instance};9:1`, name: "Dot", type: "RECTANGLE", w: 4, h: 4, fill: "#ABCDEF" },
+    { id: `I${instance};9:2;9:3`, name: "Nested dot", type: "RECTANGLE", w: 4, h: 4, fill: "#ABCDEF" }
+  ] });
+  const doc = normalize({ canvas: { id: "c", name: "C", width: 300, height: 100 }, nodes: [copy("1:1", 0), copy("1:2", 50), copy("1:3", 100), { id: "own", name: "Own", type: "RECTANGLE", x: 200, w: 4, h: 4, fill: "#ABCDEF" }] } as never);
+  const { colours } = systemInventory(doc);
+  const dots = colours.find((entry) => entry.value === "#ABCDEF")!;
+  assert.equal(dots.count, 3, "two main-component layers + one direct layer");
+  assert.equal(dots.nodeIds.length, 7, "nodeIds list every node id");
+  assert.equal(colours.find((entry) => entry.value === "#123456")!.count, 3, "each placed instance root is its own layer");
+});
+
+test("inventory counts: hidden layers (with subtrees), hidden or 0-opacity paints and hidden effects are skipped; components per instance", () => {
+  const doc = normalize({ canvas: { id: "c", name: "C", width: 100, height: 100, fill: "#EEEEEE" }, nodes: [
+    { id: "hidden", name: "Hidden", type: "FRAME", w: 50, h: 50, visible: false, fill: "#111111", cornerRadius: 4, layout: { direction: "VERTICAL", itemSpacing: 12 }, children: [
+      { id: "inner", name: "Inner", type: "TEXT", w: 10, h: 10, text: "x", font: { family: "Inter", style: "Regular", size: 40 }, fill: "#222222" },
+      { id: "inner-i", name: "Inner I", type: "INSTANCE", componentId: "comp", w: 4, h: 4 }
+    ] },
+    { id: "paints", name: "Paints", type: "RECTANGLE", w: 10, h: 10, fills: [{ type: "SOLID", color: { r: 51, g: 51, b: 51, a: 1 }, visible: false }, { type: "SOLID", color: { r: 68, g: 68, b: 68, a: 1 }, opacity: 0 }, "#555555"],
+      effects: [{ type: "DROP_SHADOW", color: "#00000040", radius: 4, visible: false }, { type: "LAYER_BLUR", radius: 2 }] },
+    { id: "comp", name: "Comp", type: "COMPONENT", x: 60, w: 10, h: 10, fill: "#EEEEEE" },
+    { id: "i1", name: "I1", type: "INSTANCE", componentId: "comp", x: 80, w: 10, h: 10 },
+    { id: "i2", name: "I2", type: "INSTANCE", componentId: "comp", x: 80, y: 20, w: 10, h: 10 }
+  ] } as never);
+  const inventory = systemInventory(doc);
+  assert.deepEqual(inventory.colours.map((entry) => entry.value).sort(), ["#555555", "#EEEEEE"]);
+  assert.deepEqual([inventory.type, inventory.spacing, inventory.radius], [[], [], []]);
+  assert.deepEqual(inventory.effects.map((entry) => entry.value.type), ["LAYER_BLUR"]);
+  assert.deepEqual(inventory.components, [{ id: "comp", name: "Comp", instanceCount: 2, instanceIds: ["i1", "i2"] }], "hidden instance not counted");
+});
+
+test("inventory counts on the generic sample frame", () => {
+  const raw = readFileSync(join("tests", "fixtures", "sample-frame.json"), "utf8");
+  const inventory = systemInventory(normalize(JSON.parse(raw)));
+  assert.ok(!inventory.spacing.some((entry) => entry.value === 0) && !inventory.radius.some((entry) => entry.value === 0), "no 0 px tile");
+  for (const hex of ["#FF00AA", "#00FFAA"]) {
+    assert.ok(raw.includes(`"${hex}"`), `${hex} is in the export`);
+    assert.ok(!inventory.colours.some((entry) => entry.value === hex), `${hex} only sits on hidden layers`);
+  }
+  assert.deepEqual(inventory.spacing.map((entry) => [entry.value, entry.count]), [[8, 1], [16, 1]]);
+  assert.deepEqual(inventory.radius.map((entry) => [entry.value, entry.count]), [[12, 1]]);
+  assert.deepEqual(inventory.colours.map((entry) => entry.value).sort(), ["#111827", "#6B7280", "#F4F4F5", "#FFFFFF"]);
+});
+
+test("systemSheet has no Components section, while systemInventory still lists components", () => {
+  const inventory = systemInventory(sheetSource());
+  assert.deepEqual(inventory.components.map((entry) => entry.name), ["Badge", "gone"], "inventory keeps components for JSON/MCP");
+  const sheet = systemSheet(inventory, { id: "ss", origin: { x: 0, y: 0 }, ...SHEET_OPTS });
+  assert.deepEqual(sheet.nodes[0].children.slice(1).map((child) => child.name), ["Colours", "Type", "Spacing", "Radius", "Effects"]);
+  assert.deepEqual([...SYSTEM_SHEET_SECTIONS], ["Colours", "Type", "Spacing", "Radius", "Effects"]);
+  const types: string[] = []; const walk = (node: InternalNode): void => { types.push(node.type); node.children.forEach(walk); }; walk(sheet.nodes[0]);
+  assert.ok(!types.includes("INSTANCE"));
+  const elliot = systemSheet(systemInventory(normalize(JSON.parse(readFileSync(join("tests", "fixtures", "sample-frame.json"), "utf8")))), { id: "sample", origin: { x: 0, y: 0 }, ...SHEET_OPTS });
+  const elliotTypes: string[] = []; const names: string[] = []; const walkE = (node: InternalNode): void => { elliotTypes.push(node.type); names.push(node.name); node.children.forEach(walkE); }; walkE(elliot.nodes[0]);
+  assert.ok(!names.includes("Components") && !elliotTypes.includes("INSTANCE"), "sample frame: no Components section, no instances");
+});

@@ -1,0 +1,21 @@
+# Installed by `npm install` (package.json "prepare").
+# Commit stays fast. Push and CI both run the full check.
+
+pre-commit:
+  parallel: true
+  skip:
+    - merge
+    - rebase
+  commands:
+    lint:
+      glob: "*.{ts,mjs,json}"
+      run: npm run lint
+    typecheck:
+      glob: "*.{ts,json}"
+      run: npm run typecheck
+
+pre-push:
+  commands:
+    check:
+      glob: "*.{ts,mjs,json}"
+      run: npm run check

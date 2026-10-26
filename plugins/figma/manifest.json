@@ -1,0 +1,13 @@
+{
+  "name": "Compact Design Importer",
+  "id": "1530890358482107642",
+  "api": "1.0.0",
+  "main": "dist/code.js",
+  "ui": "dist/ui.html",
+  "editorType": ["figma"],
+  "documentAccess": "dynamic-page",
+  "networkAccess": {
+    "allowedDomains": ["*", "http://localhost:18791"],
+    "reasoning": "Users may import image fills from HTTPS URLs they choose in their design JSON. The optional Compact Design MCP bridge is a local server on localhost."
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "name": "@compact-design/mcp",
+  "version": "1.0.0",
+  "private": true,
+  "description": "MCP server for Compact Design: validate JSON and import it into a running Figma plugin.",
+  "license": "MPL-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node scripts/test.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "node scripts/lint.mjs",
+    "start": "node scripts/cli.mjs"
+  },
+  "dependencies": {
+    "@compact-design/core": "1.0.0",
+    "@compact-design/html": "1.0.0"
+  }
+}
